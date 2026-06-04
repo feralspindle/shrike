@@ -49,11 +49,16 @@ jobs:
               - 'src/shrike/**'
               - 'tests/integration/test_embedding.py'
               - 'tests/integration/test_semantic.py'
+              # Shared harness that the embedding lane depends on (model
+              # download/cache, server fixtures) and the workflow itself.
+              - 'tests/integration/conftest.py'
+              - 'tests/integration/model_cache.py'
               - 'tests/unit/test_embedding.py'
               - 'tests/unit/test_index.py'
               - 'tests/unit/test_note_embedding_text.py'
               - 'tests/unit/test_tools_search.py'
               - '.github/scripts/install-llama-server.sh'
+              - '.github/workflows/test.yml'
               - 'pyproject.toml'
               - '.github/workflows/test.yml'
 
@@ -130,13 +135,29 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: pyproject.toml
+      # Cache the pinned llama-server build so we don't re-download the release
+      # tarball every run (#83). Keyed on the lock file (tag + SHA256), so a bump
+      # invalidates it; install-llama-server.sh skips the download on a hit.
+      - name: Cache llama-server
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/llama-server
+          key: llama-server-${{ runner.os }}-${{ hashFiles('scripts/llama-server.lock') }}
       - name: Install llama-server
         run: bash .github/scripts/install-llama-server.sh
       - name: Install dependencies
         run: pip install -e ".[dev]"
+      # Persist the GGUF across runs so we don't re-hit HuggingFace every time
+      # (the source of the 429 flake, #83). The fixture reads SHRIKE_TEST_MODEL_DIR.
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/shrike-test-models
+          key: embedding-model-all-MiniLM-L6-v2-Q4_K_M
       - name: Run embedding tests
         env:
           LD_LIBRARY_PATH: ${{ env.LLAMA_DIR }}
+          SHRIKE_TEST_MODEL_DIR: ${{ runner.temp }}/shrike-test-models
         run: pytest tests/integration -v -m embedding
 
   # macOS + ARM are expensive (macOS bills at 10x), so they NEVER run on plain
@@ -162,14 +183,25 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: pyproject.toml
+      - name: Cache llama-server
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/llama-server
+          key: llama-server-${{ matrix.os }}-${{ hashFiles('scripts/llama-server.lock') }}
       - name: Install llama-server
         run: bash .github/scripts/install-llama-server.sh
       - name: Install dependencies
         run: pip install -e ".[dev]"
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/shrike-test-models
+          key: embedding-model-all-MiniLM-L6-v2-Q4_K_M-${{ matrix.os }}
       - name: Run integration + embedding tests
         env:
           LD_LIBRARY_PATH: ${{ env.LLAMA_DIR }}
           DYLD_LIBRARY_PATH: ${{ env.LLAMA_DIR }}
+          SHRIKE_TEST_MODEL_DIR: ${{ runner.temp }}/shrike-test-models
         run: pytest tests/integration -v -m integration
 
   # Single required status check. Always runs, and passes iff every gated job
