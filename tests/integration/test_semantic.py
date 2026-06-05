@@ -534,6 +534,72 @@ class TestDeleteIndexUpdate:
 
 
 # ---------------------------------------------------------------------------
+# Empty-at-boot indexing (#148)
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyBootIndexing:
+    """A server booted against an empty collection should still index notes
+    added later in the same session (#148)."""
+
+    def test_upsert_into_empty_boot_collection_is_indexed(
+        self, server_factory, embedding_model
+    ) -> None:
+        # A dedicated server with its own empty collection (not the shared,
+        # rebuilt collection_server). An empty collection's index is trivially
+        # complete, so boot materializes an empty, ready index (#148).
+        srv = server_factory("empty-boot-index", embedding_model=str(embedding_model))
+        base = _base_url(srv)
+
+        # The embedding service must be up before we upsert; otherwise a skip
+        # would be for the wrong reason (no embedder) rather than the bug.
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if httpx.get(f"{base}/status", timeout=5.0).json()["embedding"]["available"]:
+                break
+            time.sleep(0.5)
+        else:
+            pytest.skip("embedding service did not become available")
+
+        mcp = MCPClient(srv.url)
+        result = mcp(
+            "upsert_notes",
+            {
+                "notes": [
+                    {
+                        "deck": "Bio",
+                        "note_type": "Basic",
+                        "fields": {
+                            "Front": "What is a ribosome?",
+                            "Back": "The cellular machine that synthesizes proteins",
+                        },
+                        "tags": ["cell-biology"],
+                    }
+                ]
+            },
+        )
+        assert result["results"][0]["status"] == "created"
+
+        # No explicit /index/rebuild: boot materialized an empty, ready index, so
+        # `index.available` is True and the incremental upsert path indexed the
+        # note (index.add() is self-sufficient — _ensure_index() sizes the USearch
+        # index from the embedding dimension).
+        idx = httpx.get(f"{base}/status", timeout=5.0).json()["index"]
+        assert idx["available"] is True
+        assert idx["size"] >= 1
+
+        # And the note is actually semantically searchable in the same session.
+        # threshold=0 so the assertion doesn't hinge on the small quantized test
+        # model clearing the default 0.5 cutoff (see test_similar_concepts_rank_higher).
+        search = mcp(
+            "search_notes",
+            {"queries": ["protein synthesis organelle"], "top_k": 5, "threshold": 0.0},
+        )
+        matches = search["results"][0]["matches"]
+        assert any("cell-biology" in m.get("tags", []) for m in matches)
+
+
+# ---------------------------------------------------------------------------
 # CLI commands: index and embedding
 # ---------------------------------------------------------------------------
 
@@ -697,9 +763,8 @@ class TestEmbeddingLifecycle:
                 ]
             },
         )
-        # Populate the index from the seeded collection (an empty-at-boot server
-        # does no rebuild, so incremental upserts alone leave it empty).
-        httpx.post(f"{_base_url(srv)}/index/rebuild", timeout=30.0)
+        # No explicit rebuild needed: an empty-at-boot server materializes a
+        # ready index at boot (#148), so the upserts above index incrementally.
         _wait_for_index_ready(srv)
         return srv
 
