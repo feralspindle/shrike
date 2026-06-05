@@ -864,7 +864,7 @@ class TestNoteTypeLifecycle:
         )
         assert result["results"][0]["status"] == "error"
 
-    def test_find_replace_in_note_type(self, mcp):
+    def test_find_replace_note_types(self, mcp):
         # findAndReplaceInModels (#76): literal find/replace across a model's
         # template HTML and CSS, scoped by front/back/css, returning a count.
         mcp(
@@ -881,7 +881,7 @@ class TestNoteTypeLifecycle:
             },
         )
         result = mcp(
-            "find_replace_in_note_type",
+            "find_replace_note_types",
             {"note_type": "FRModel", "search": "{{Old}}", "replace": "{{New}}"},
         )
         assert result["replacements"] == 2
@@ -890,7 +890,7 @@ class TestNoteTypeLifecycle:
 
         # A CSS-only replace, with the templates excluded.
         css = mcp(
-            "find_replace_in_note_type",
+            "find_replace_note_types",
             {
                 "note_type": "FRModel",
                 "search": "red",
@@ -909,10 +909,10 @@ class TestNoteTypeLifecycle:
         assert nt["detail"]["templates"][0]["front"] == "{{New}}"
         assert "color: blue" in nt["detail"]["css"]
 
-    def test_find_replace_in_note_type_unknown(self, mcp):
+    def test_find_replace_note_types_unknown(self, mcp):
         with pytest.raises(RuntimeError, match="not found"):
             mcp(
-                "find_replace_in_note_type",
+                "find_replace_note_types",
                 {"note_type": "DoesNotExist", "search": "a", "replace": "b"},
             )
 
@@ -1109,6 +1109,43 @@ class TestDeckOps:
         assert mcp("list_notes", {"deck": str(did)})["total"] == 1
         # non-empty deck deleted by #id is refused (echoing the ref)
         assert mcp("delete_decks", {"decks": [f"#{did}"]})["not_empty"] == [f"#{did}"]
+
+
+class TestFindReplace:
+    """find_replace_notes over transport."""
+
+    def _make(self, mcp, deck, front, back="x"):
+        note = {"deck": deck, "note_type": "Basic", "fields": {"Front": front, "Back": back}}
+        mcp("upsert_notes", {"notes": [note]})
+
+    def test_dry_run_then_apply(self, mcp):
+        self._make(mcp, "FR", "teh cell", "teh power")
+        args = {"search": "teh", "replace": "the", "deck": "FR", "dry_run": True}
+        dry = mcp("find_replace_notes", args)
+        assert dry["dry_run"] is True
+        assert dry["notes_changed"] == 1
+        assert dry["samples"]
+        # dry-run changed nothing
+        assert mcp("list_notes", {"deck": "FR"})["notes"][0]["content"]["Front"] == "teh cell"
+
+        applied = mcp("find_replace_notes", {"search": "teh", "replace": "the", "deck": "FR"})
+        assert applied["notes_changed"] == 1
+        note = mcp("list_notes", {"deck": "FR"})["notes"][0]
+        assert note["content"]["Front"] == "the cell"
+        assert note["content"]["Back"] == "the power"
+
+    def test_regex(self, mcp):
+        self._make(mcp, "FRrx", "colour and flavour")
+        applied = mcp(
+            "find_replace_notes",
+            {"search": "(colou?r|flavou?r)", "replace": "X", "regex": True, "deck": "FRrx"},
+        )
+        assert applied["notes_changed"] == 1
+        assert mcp("list_notes", {"deck": "FRrx"})["notes"][0]["content"]["Front"] == "X and X"
+
+    def test_requires_scope(self, mcp):
+        with pytest.raises(RuntimeError, match="scope"):
+            mcp("find_replace_notes", {"search": "a", "replace": "b"})
 
 
 class TestStatusEndpoint:

@@ -17,7 +17,8 @@ from shrike.schemas import (
     DeleteNotesResponse,
     DeleteNoteTypesResponse,
     FieldOp,
-    FindReplaceInNoteTypeResponse,
+    FindReplaceNoteTypesResponse,
+    FindReplaceResponse,
     ListNotesResponse,
     NoteInput,
     NoteTypeInput,
@@ -94,7 +95,7 @@ def register_tools(
     saver: IndexSaver | None = None,
 ) -> None:
     from shrike.note_types import NoteTypeOpError
-    from shrike.note_types import find_and_replace_in_note_type as _find_and_replace_in_note_type
+    from shrike.note_types import find_and_replace_note_types as _find_and_replace_note_types
     from shrike.note_types import update_note_type_fields as _update_note_type_fields
     from shrike.note_types import update_note_type_templates as _update_note_type_templates
     from shrike.note_types import upsert_note_types as _upsert_note_types
@@ -851,7 +852,7 @@ def register_tools(
 
     @mcp.tool()
     @_safe_tool
-    async def find_replace_in_note_type(
+    async def find_replace_note_types(
         note_type: Annotated[
             str, Field(min_length=1, description="Name of the note type to edit.")
         ],
@@ -882,7 +883,7 @@ def register_tools(
             bool,
             Field(description="Case-sensitive match. Default true — template/CSS text is code."),
         ] = True,
-    ) -> FindReplaceInNoteTypeResponse:
+    ) -> FindReplaceNoteTypesResponse:
         """Find and replace text inside one note type's templates and CSS.
 
         Edits the note type *definition* — each card template's front (`qfmt`)
@@ -906,7 +907,7 @@ def register_tools(
         if not (front or back or css):
             raise ToolInputError("Enable at least one of `front`, `back`, or `css`.")
         logger.info(
-            "find_replace_in_note_type %r search=%r front=%s back=%s css=%s regex=%s",
+            "find_replace_note_types %r search=%r front=%s back=%s css=%s regex=%s",
             note_type,
             search,
             front,
@@ -916,7 +917,7 @@ def register_tools(
         )
         try:
             result = await wrapper.run(
-                lambda c: _find_and_replace_in_note_type(
+                lambda c: _find_and_replace_note_types(
                     c,
                     note_type,
                     search=search,
@@ -931,7 +932,7 @@ def register_tools(
         except NoteTypeOpError as e:
             raise ToolInputError(str(e)) from e
         logger.info(
-            "find_replace_in_note_type %r -> %d replacement(s) in %d template(s), css=%s",
+            "find_replace_note_types %r -> %d replacement(s) in %d template(s), css=%s",
             note_type,
             result["replacements"],
             len(result["templates_changed"]),
@@ -942,7 +943,7 @@ def register_tools(
         # re-embedding, like the tag/deck metadata ops.
         if result["replacements"]:
             await _bump_col_mod_after_metadata_change()
-        return FindReplaceInNoteTypeResponse.model_validate(result)
+        return FindReplaceNoteTypesResponse.model_validate(result)
 
     @mcp.tool()
     @_safe_tool
@@ -979,6 +980,109 @@ def register_tools(
                 logger.warning("Failed to update index after delete", exc_info=True)
 
         return DeleteNotesResponse.model_validate(result)
+
+    @mcp.tool()
+    @_safe_tool
+    async def find_replace_notes(
+        search: Annotated[
+            str, Field(min_length=1, description="Text (or regex) to find in note fields.")
+        ],
+        replace: Annotated[
+            str,
+            Field(description="Replacement text. In regex mode, capture refs use Anki's `$1`."),
+        ],
+        *,
+        regex: Annotated[
+            bool, Field(description="Treat `search` as a regular expression (Anki's engine).")
+        ] = False,
+        match_case: Annotated[
+            bool, Field(description="Case-sensitive match. Default false.")
+        ] = False,
+        field: Annotated[
+            str | None,
+            Field(description="Restrict to this single field name; omit to search all fields."),
+        ] = None,
+        deck: Annotated[
+            str | None,
+            Field(
+                description="Scope to this deck (name, numeric id, or #id; includes child decks)."
+            ),
+        ] = None,
+        tags: Annotated[
+            list[str],
+            Field(default_factory=list, description="Scope to notes having all of these tags."),
+        ],
+        note_type: Annotated[
+            str | None, Field(description="Scope to notes using this note type.")
+        ] = None,
+        ids: Annotated[
+            list[int], Field(default_factory=list, description="Scope to these note IDs.")
+        ],
+        dry_run: Annotated[
+            bool,
+            Field(
+                description="Preview only — report what would change without modifying. "
+                "Default false (applies the edit)."
+            ),
+        ] = False,
+    ) -> FindReplaceResponse:
+        """Find and replace text across the fields of a scoped set of notes.
+
+        A scope is **required**: at least one of `deck`, `tags`, `note_type`, or
+        `ids` (the same filters as list_notes). `search` is literal by default;
+        set `regex` for a regular expression (Anki's engine — capture references
+        in `replace` use `$1`). `field` restricts to one field; otherwise all
+        fields are searched.
+
+        By default this **applies** the change and returns `notes_changed` with a
+        sample of before/after edits; pass `dry_run` to preview without modifying.
+        Changed notes are re-embedded so semantic search stays correct, and the
+        edit is undoable in Anki. For literal searches the dry-run preview matches
+        the apply exactly; for regex the preview is a best-effort sample and the
+        apply is authoritative."""
+        if not any([deck, tags, note_type, ids]):
+            raise ToolInputError("A scope is required: deck, tags, note_type, or ids.")
+
+        logger.info(
+            "find_replace_notes search=%r regex=%s field=%s dry_run=%s",
+            search,
+            regex,
+            field,
+            dry_run,
+        )
+        result = await wrapper.find_replace(
+            search,
+            replace,
+            regex=regex,
+            match_case=match_case,
+            field=field,
+            deck=deck,
+            tags=tags or None,
+            note_type=note_type,
+            ids=ids or None,
+            dry_run=dry_run,
+        )
+        changed_ids = result.pop("changed_ids", [])
+        logger.info(
+            "find_replace_notes %s %d note(s)",
+            "would change" if dry_run else "changed",
+            result["notes_changed"],
+        )
+
+        if not dry_run and changed_ids and index and index.available:
+            # Field bodies are embedding text, so re-embed the changed notes
+            # (best-effort, like upsert_notes).
+            try:
+                texts = await wrapper.note_texts_for_embedding(changed_ids)
+                index.add(changed_ids, texts)
+                index.col_mod = await wrapper.run(lambda c: c.mod)
+                if saver is not None:
+                    saver.request_save()
+                logger.debug("Index updated after find_replace: %d vectors", len(changed_ids))
+            except Exception:
+                logger.warning("Failed to update index after find_replace", exc_info=True)
+
+        return FindReplaceResponse.model_validate(result)
 
     @mcp.tool()
     @_safe_tool

@@ -41,7 +41,8 @@ from shrike.schemas import (
     EmbeddingStatus,
     EmbeddingStopResponse,
     FieldOp,
-    FindReplaceInNoteTypeResponse,
+    FindReplaceNoteTypesResponse,
+    FindReplaceResponse,
     IndexRebuildResponse,
     IndexSaveResponse,
     IndexStatus,
@@ -345,7 +346,7 @@ class ShrikeClient:
             self._call("update_note_type_templates", {"note_type": note_type, "operations": ops})
         )
 
-    def find_replace_in_note_type(
+    def find_replace_note_types(
         self,
         note_type: str,
         search: str,
@@ -356,10 +357,10 @@ class ShrikeClient:
         css: bool = True,
         regex: bool = False,
         match_case: bool = True,
-    ) -> FindReplaceInNoteTypeResponse:
-        return FindReplaceInNoteTypeResponse.model_validate(
+    ) -> FindReplaceNoteTypesResponse:
+        return FindReplaceNoteTypesResponse.model_validate(
             self._call(
-                "find_replace_in_note_type",
+                "find_replace_note_types",
                 {
                     "note_type": note_type,
                     "search": search,
@@ -449,6 +450,38 @@ class ShrikeClient:
 
     def delete_decks(self, names: list[str]) -> DeleteDecksResponse:
         return DeleteDecksResponse.model_validate(self._call("delete_decks", {"decks": names}))
+
+    def find_replace_notes(
+        self,
+        search: str,
+        replace: str,
+        *,
+        regex: bool = False,
+        match_case: bool = False,
+        field: str | None = None,
+        deck: str | None = None,
+        tags: list[str] | None = None,
+        note_type: str | None = None,
+        ids: list[int] | None = None,
+        dry_run: bool = False,
+    ) -> FindReplaceResponse:
+        args: dict[str, Any] = {
+            "search": search,
+            "replace": replace,
+            "regex": regex,
+            "match_case": match_case,
+            "dry_run": dry_run,
+        }
+        for key, value in (
+            ("field", field),
+            ("deck", deck),
+            ("tags", tags),
+            ("note_type", note_type),
+            ("ids", ids),
+        ):
+            if value is not None:
+                args[key] = value
+        return FindReplaceResponse.model_validate(self._call("find_replace_notes", args))
 
     def _batched_call(
         self,
