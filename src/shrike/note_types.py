@@ -123,20 +123,51 @@ def _set_fields(col: Collection, notetype: dict[str, Any], names: list[str]) -> 
     ones whose position survives, appending new fields only for added positions,
     and dropping the tail for removed ones (the only positions whose data Anki
     discards). This makes a whole-list field replace data-safe, matching Anki's
-    "fields are keyed by position" rule. (A true by-identity reorder is a
-    separate, explicit operation — see #76; here a reordered name list is
-    interpreted positionally, i.e. as renames, which is non-destructive.)
+    "fields are keyed by position" rule.
+
+    Because the replace is positional, it can only express a rename-in-place, an
+    append, or a trailing remove. Anything that *moves* an existing field —
+    a reorder, an insert before another field, or a non-trailing remove — would
+    silently re-label note data (the value stays in its slot while the name on
+    that slot changes). We refuse those: see ``_reject_unsound_field_replace``.
+    Use ``update_note_type_fields`` for identity-based moves/inserts/removes.
     """
-    old = notetype["flds"]
+    old = [f["name"] for f in notetype["flds"]]
+    _reject_unsound_field_replace(old, names)
+
+    old_flds = notetype["flds"]
     new = []
     for i, name in enumerate(names):
-        if i < len(old):
-            field = old[i]
+        if i < len(old_flds):
+            field = old_flds[i]
             field["name"] = name
         else:
             field = col.models.new_field(name)
         new.append(field)
     notetype["flds"] = new
+
+
+def _reject_unsound_field_replace(old: list[str], new: list[str]) -> None:
+    """Reject a positional field replace that would mislabel note data.
+
+    The replace renames the field *at position i* to ``new[i]``; data never
+    leaves its slot. That's sound only while every existing field name stays at
+    its current position. If an existing name appears at a *different* position
+    in ``new``, the caller is really asking to move it (reorder, insert, or
+    non-trailing remove, which shifts the names after it) — which positionally
+    becomes a silent re-label. Refuse it and point at the explicit tool.
+    """
+    old_index = {name: i for i, name in enumerate(old)}
+    for i, name in enumerate(new):
+        if name in old_index and old_index[name] != i:
+            raise ValueError(
+                f"Field '{name}' would move from position {old_index[name]} to {i}. "
+                "upsert_note_types replaces fields by position — it can only rename a "
+                "field in place, append new fields, or drop trailing fields; moving, "
+                "inserting, or removing a non-trailing field this way would silently "
+                "mislabel note data. Use update_note_type_fields (reposition / add / "
+                "remove / rename) for that."
+            )
 
 
 def _set_templates(
@@ -161,3 +192,111 @@ def _set_templates(
         tmpl["afmt"] = tmpl_input["back"]
         new.append(tmpl)
     notetype["tmpls"] = new
+
+
+class FieldOpError(ValueError):
+    """An explicit field operation was invalid (unknown field, name clash, etc.).
+
+    A plain ``ValueError`` subclass so the tool layer can translate it into a
+    ``ToolInputError`` (logged without a traceback — it's caller error).
+    """
+
+
+def update_note_type_fields(
+    col: Collection, note_type_name: str, operations: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Apply explicit, identity-based field operations to a note type.
+
+    Unlike ``upsert_note_types``' position-keyed whole-list replace, these
+    operations are addressed by field *name*, so they can express a true move
+    (``reposition``), a non-trailing ``remove``, or an insert at a position —
+    all via Anki's data-safe primitives, which migrate note data by field
+    identity. Operations apply in order; ``rename`` then a later op referencing
+    the new name is valid.
+
+    The whole call is atomic: the sequence is validated against a simulated
+    field list first, so an invalid op fails without mutating anything. Only
+    once every op is known-valid are the real primitives applied to one
+    in-memory notetype and persisted with a single ``update_dict``.
+    """
+    notetype = col.models.by_name(note_type_name)
+    if notetype is None:
+        raise FieldOpError(f"Note type '{note_type_name}' not found")
+
+    # Validate the whole sequence first (atomic: nothing applied if any op is
+    # bad). `sim` tracks field names as each op would leave them.
+    sim = [f["name"] for f in notetype["flds"]]
+    for i, op in enumerate(operations):
+        _simulate_field_op(sim, op, i)
+
+    # `by_name` returned the live notetype dict; the Anki primitives mutate it
+    # (and its `flds`) in place, so apply them all to it and persist once.
+    for op in operations:
+        _apply_field_op(col, notetype, op)
+    col.models.update_dict(notetype)
+
+    final = [f["name"] for f in notetype["flds"]]
+    logger.debug(
+        "update_note_type_fields %r: applied %d op(s) -> %s",
+        note_type_name,
+        len(operations),
+        final,
+    )
+    return {"id": notetype["id"], "name": note_type_name, "fields": final}
+
+
+def _simulate_field_op(sim: list[str], op: dict[str, Any], i: int) -> None:
+    kind = op["op"]
+    if kind == "add":
+        name = op["name"]
+        if name in sim:
+            raise FieldOpError(f"op {i} (add): field '{name}' already exists")
+        pos = op.get("position")
+        if pos is None:
+            sim.append(name)
+        elif not 0 <= pos <= len(sim):
+            raise FieldOpError(f"op {i} (add): position {pos} out of range 0..{len(sim)}")
+        else:
+            sim.insert(pos, name)
+    elif kind == "remove":
+        name = op["name"]
+        if name not in sim:
+            raise FieldOpError(f"op {i} (remove): field '{name}' not found")
+        if len(sim) == 1:
+            raise FieldOpError(f"op {i} (remove): a note type must keep at least one field")
+        sim.remove(name)
+    elif kind == "rename":
+        name, new = op["name"], op["new_name"]
+        if name not in sim:
+            raise FieldOpError(f"op {i} (rename): field '{name}' not found")
+        if new != name and new in sim:
+            raise FieldOpError(f"op {i} (rename): field '{new}' already exists")
+        sim[sim.index(name)] = new
+    elif kind == "reposition":
+        name, pos = op["name"], op["position"]
+        if name not in sim:
+            raise FieldOpError(f"op {i} (reposition): field '{name}' not found")
+        if not 0 <= pos < len(sim):
+            raise FieldOpError(
+                f"op {i} (reposition): position {pos} out of range 0..{len(sim) - 1}"
+            )
+        sim.remove(name)
+        sim.insert(pos, name)
+
+
+def _apply_field_op(col: Collection, notetype: dict[str, Any], op: dict[str, Any]) -> None:
+    # Look fields up by their current name each call, so an op that follows a
+    # rename/reposition sees the up-to-date list.
+    by_name = {f["name"]: f for f in notetype["flds"]}
+    kind = op["op"]
+    if kind == "add":
+        field = col.models.new_field(op["name"])
+        col.models.add_field(notetype, field)
+        if op.get("position") is not None:
+            col.models.reposition_field(notetype, field, op["position"])
+    elif kind == "remove":
+        col.models.remove_field(notetype, by_name[op["name"]])
+    elif kind == "rename":
+        col.models.rename_field(notetype, by_name[op["name"]], op["new_name"])
+    elif kind == "reposition":
+        col.models.reposition_field(notetype, by_name[op["name"]], op["position"])

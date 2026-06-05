@@ -319,7 +319,7 @@ Card templates use Anki's `{{FieldName}}` replacement syntax. The special `{{Fro
 |---|---|---|---|
 | `id` | `integer` | no | Note type ID. Present = update, absent = create. |
 | `name` | `string` | create | Name for the note type (e.g., `"Japanese Vocabulary"`). |
-| `fields` | `string[]` | create | Ordered list of field names (e.g., `["Word", "Reading", "Meaning"]`). On update, replaces the field list **by position**: the field at each position keeps its note data even when renamed. Only shortening the list discards the trailing fields' data; lengthening it appends empty fields. |
+| `fields` | `string[]` | create | Ordered list of field names (e.g., `["Word", "Reading", "Meaning"]`). On update, replaces the field list **by position**: the field at each position keeps its note data even when renamed. Only shortening the list discards the trailing fields' data; lengthening it appends empty fields. May only rename in place, append, or drop trailing fields — a move, insert, or non-trailing remove is **rejected** (it would mislabel note data); use [`update_note_type_fields`](#update_note_type_fields). |
 | `templates` | `object[]` | create | Card templates. Each produces one card per note (except cloze types). On update, replaced **by position** like `fields`: existing cards (and their scheduling history) are preserved; only removing a trailing template deletes its cards. See template schema below. |
 | `css` | `string` | create | CSS styling shared across all cards of this note type. |
 | `is_cloze` | `boolean` | no | If `true`, this is a cloze deletion note type. Default `false`. Cannot be changed on update. |
@@ -375,6 +375,40 @@ Card templates use Anki's `{{FieldName}}` replacement syntax. The special `{{Fro
       ]
     }
   ]
+}
+```
+
+---
+
+## `update_note_type_fields`
+
+Edit an existing note type's fields **by name**, preserving note data. Where `upsert_note_types` replaces the whole field list by position (so it can only rename in place, append, or drop the trailing field), this tool applies a sequence of identity-addressed operations and can truly move a field, insert one at a position, or remove a non-trailing field — all migrating note data by field identity.
+
+Operations apply in order, so a `rename` followed by an op naming the new name is valid. The whole call is **atomic**: if any operation is invalid (unknown field, name clash, out-of-range position, or removing the last remaining field), nothing is changed.
+
+### Parameters
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `note_type` | `string` | **yes** | Name of the note type to edit. |
+| `operations` | `object[]` | **yes** | Field operations to apply in order (1–50). Each is one of the variants below, discriminated on `op`. |
+
+#### Operation variants
+
+| `op` | Fields | Effect |
+|---|---|---|
+| `add` | `name`, `position?` | Add a new (empty) field. Inserted at `position` (0-based) if given, else appended. |
+| `remove` | `name` | Remove the field. **Drops that field's data from every note** of this type. Can't remove the last remaining field. |
+| `rename` | `name`, `new_name` | Rename the field, preserving its data. |
+| `reposition` | `name`, `position` | Move the field to `position` (0-based); its data moves with it. |
+
+### Response
+
+```jsonc
+{
+  "id": 1234567890,
+  "name": "Japanese Vocabulary",
+  "fields": ["Reading", "Word", "Meaning", "Notes"]   // the resulting order
 }
 ```
 

@@ -685,6 +685,101 @@ class TestNoteTypeLifecycle:
         listed = mcp("list_notes", {"ids": [note_id]})["notes"][0]
         assert listed["content"] == {"Frente": "Q", "Back": "A"}
 
+    def test_field_ops_move_rename_remove(self, mcp):
+        # update_note_type_fields: identity-based ops preserve data (#76).
+        mcp(
+            "upsert_note_types",
+            {
+                "note_types": [
+                    {
+                        "name": "Ops",
+                        "fields": ["A", "B", "C"],
+                        "templates": [{"name": "C1", "front": "{{A}}", "back": "{{B}}{{C}}"}],
+                        "css": "",
+                    }
+                ]
+            },
+        )
+        note = mcp(
+            "upsert_notes",
+            {
+                "notes": [
+                    {
+                        "deck": "Ops",
+                        "note_type": "Ops",
+                        "fields": {"A": "va", "B": "vb", "C": "vc"},
+                    }
+                ]
+            },
+        )
+        note_id = note["results"][0]["id"]
+
+        result = mcp(
+            "update_note_type_fields",
+            {
+                "note_type": "Ops",
+                "operations": [
+                    {"op": "reposition", "name": "C", "position": 0},
+                    {"op": "rename", "name": "A", "new_name": "Alpha"},
+                    {"op": "remove", "name": "B"},
+                    {"op": "add", "name": "D"},
+                ],
+            },
+        )
+        assert result["fields"] == ["C", "Alpha", "D"]
+        listed = mcp("list_notes", {"ids": [note_id]})["notes"][0]
+        assert listed["content"] == {"C": "vc", "Alpha": "va", "D": ""}
+
+    def test_field_ops_invalid_is_atomic(self, mcp):
+        mcp(
+            "upsert_note_types",
+            {
+                "note_types": [
+                    {
+                        "name": "Atomic",
+                        "fields": ["X", "Y"],
+                        "templates": [{"name": "C1", "front": "{{X}}", "back": "{{Y}}"}],
+                        "css": "",
+                    }
+                ]
+            },
+        )
+        with pytest.raises(RuntimeError, match="not found"):
+            mcp(
+                "update_note_type_fields",
+                {
+                    "note_type": "Atomic",
+                    "operations": [
+                        {"op": "rename", "name": "X", "new_name": "Xx"},
+                        {"op": "remove", "name": "Nope"},
+                    ],
+                },
+            )
+        info = mcp("collection_info", {"include": ["note_types"]})
+        atomic = next(nt for nt in info["note_types"] if nt["name"] == "Atomic")
+        assert atomic["fields"] == ["X", "Y"]  # unchanged
+
+    def test_upsert_field_reorder_rejected(self, mcp):
+        # The position-keyed upsert refuses a move (would mislabel data) and
+        # redirects to update_note_type_fields.
+        created = mcp(
+            "upsert_note_types",
+            {
+                "note_types": [
+                    {
+                        "name": "NoReorder",
+                        "fields": ["A", "B"],
+                        "templates": [{"name": "C1", "front": "{{A}}", "back": "{{B}}"}],
+                        "css": "",
+                    }
+                ]
+            },
+        )
+        nt_id = created["results"][0]["id"]
+        result = mcp("upsert_note_types", {"note_types": [{"id": nt_id, "fields": ["B", "A"]}]})
+        assert result["results"][0]["status"] == "error"
+        assert "update_note_type_fields" in result["results"][0]["error"]
+
     def test_duplicate_name_rejected(self, mcp):
         result = mcp(
             "upsert_note_types",

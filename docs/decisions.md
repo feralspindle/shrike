@@ -211,5 +211,47 @@ lengthening appends empty fields / new cards; shortening discards only the
 trailing entries (the standard meaning of removing a field/template). A genuine
 *reorder* (moving a field/template to a new position while keeping its identity)
 is necessarily a separate, explicit operation — a positional name swap reads as
-two renames, which is non-destructive but not a move. That dedicated
-rename/reposition/add/remove surface is the remaining, lower-risk half of #76.
+two renames, which is non-destructive but not a move.
+
+### Identity-based field ops are a second tool, not a mode of `upsert_note_types` (#76)
+
+The genuine move/insert/non-trailing-remove that position-replace can't express
+is the `update_note_type_fields` tool: a sequence of `add`/`remove`/`rename`/
+`reposition` operations addressed by field **name**. It exists separately from
+`upsert_note_types` rather than as another shape of its `fields` param because the
+two are fundamentally different contracts — a *declarative* "the fields are now
+exactly this list" (position-keyed) versus an *imperative* "move X to 0, rename Y"
+(identity-keyed). Conflating them in one param would make "is `["B","A"]` a reorder
+or two renames?" ambiguous; keeping them apart makes each unambiguous.
+
+It delegates to Anki's own data-safe primitives (`rename_field`,
+`reposition_field`, `add_field`, `remove_field`), which migrate note data by
+field identity, so a reposition is a true move (data follows the field) and a
+non-trailing remove drops only that field. The call is **atomic**: the whole op
+sequence is validated against a simulated field-name list first, so an invalid op
+(unknown field, name clash, out-of-range position, removing the last field)
+changes nothing; only once every op is known-good are the primitives applied to
+one in-memory notetype and persisted with a single `update_dict`. Like
+`upsert_note_types`, it does no inline index maintenance — the `col.mod` bump
+drives a drift-rebuild on next startup (correct, since a removed field changes a
+note's embedding text).
+
+With a correct mover in hand, the two tools are **reconciled** so they don't
+overlap dangerously: `upsert_note_types`' positional `fields` replace now
+*refuses* any update where an existing field name lands at a different position —
+a reorder, an insert before another field, or a non-trailing remove (which shifts
+the names after it). Positionally those silently re-label note data (the value
+stays in its slot while the slot's name changes), and that's exactly the footgun
+the position-keyed contract can't avoid. The check is one rule
+(`_reject_unsound_field_replace`: an existing name may not change index) and its
+error points at `update_note_type_fields`. So `upsert_note_types` keeps only the
+*unambiguous* positional edits — rename-in-place, append, trailing-remove — and
+every move/insert/middle-remove goes through the identity tool. The overlap that
+remains (rename/append/trailing-remove doable both ways) is the benign PUT-vs-PATCH
+kind; the dangerous overlap is gone. Remaining for #76: `findAndReplaceInModels`
+(overlaps the separate find-and-replace issue #85) and the field font/description
+metadata getters/setters.
+
+The same positional footgun still exists for **templates** (a reorder re-labels
+cards), but there's no template-ops tool to redirect to yet, so it's left
+unguarded for now — a follow-up when identity-based template ops land.
