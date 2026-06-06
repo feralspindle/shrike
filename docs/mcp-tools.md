@@ -600,11 +600,11 @@ Rename a tag, collection-wide or on a set of notes. With no `note_ids`, the tag 
 
 ## `collection_prune`
 
-Tidy up the collection with one or more cleanups: remove **unused tags** (tag-registry names no note uses any more), **empty notes** (notes whose every field is blank), and **empty cards** (cards that render empty, e.g. a cloze card with no matching deletion). Enable the cleanups you want; **if you set none of them, all three run.**
+Tidy up the collection with one or more cleanups: remove **unused tags** (tag-registry names no note uses any more), **empty notes** (notes whose every field is blank), **empty cards** (cards that render empty, e.g. a cloze card with no matching deletion), and **unused media** (media files no note references). Enable the cleanups you want; **if you set none of them, all run.**
 
-This is destructive (it deletes notes and cards) and cannot be undone through this tool, so `dry_run` defaults to **true** — by default it only **previews**, reporting what would be removed without changing anything. Pass `dry_run: false` to apply.
+This is destructive and cannot be undone through this tool, so `dry_run` defaults to **true** — by default it only **previews**, reporting what would be removed without changing anything. Pass `dry_run: false` to apply. Notes and cards are deleted outright; unused media goes to Anki's recoverable trash. To inspect media issues without pruning, use [`collection_check`](#collection_check).
 
-An **empty note** has every field blank, where a field is blank only if it has no text **and** no media — so a card that is just an image or audio clip is never removed. On apply, empty notes are removed first, then empty cards, then unused tags (so tags freed by the deletions are cleared in the same call). Because the dry-run previews each cleanup independently, an apply may clear a few more tags than the preview showed.
+An **empty note** has every field blank, where a field is blank only if it has no text **and** no media — so a card that is just an image or audio clip is never removed. On apply, empty notes are removed first, then empty cards, then unused tags, then unused media (so tags and media freed by the deletions are cleared in the same call). Because the dry-run previews each cleanup independently, an apply may clear a few more tags/media than the preview showed.
 
 ### Parameters
 
@@ -613,9 +613,10 @@ An **empty note** has every field blank, where a field is blank only if it has n
 | `unused_tags` | `boolean` | no | Remove tag-registry names no note uses. Default `false`. |
 | `empty_notes` | `boolean` | no | Delete notes whose every field is blank (text- and media-free). Default `false`. |
 | `empty_cards` | `boolean` | no | Remove cards that render empty; a note that loses its last card is deleted. Default `false`. |
+| `unused_media` | `boolean` | no | Move media files no note references to Anki's trash. Default `false`. |
 | `dry_run` | `boolean` | no | Preview only — report without mutating. Default `true`. |
 
-If none of `unused_tags`/`empty_notes`/`empty_cards` is set, all three run.
+If none of `unused_tags`/`empty_notes`/`empty_cards`/`unused_media` is set, all run.
 
 ### Response
 
@@ -626,8 +627,127 @@ Each cleanup reports its own section; a section is `null` (absent) when that cle
   "dry_run": true,
   "unused_tags": { "removed": 3, "tags": ["old-deck", "typo-tag", "temp"] },
   "empty_notes": { "removed": [1700000000123, 1700000000456] },
-  "empty_cards": { "cards_removed": 2, "notes_deleted": [1700000000789] }
+  "empty_cards": { "cards_removed": 2, "notes_deleted": [1700000000789] },
+  "unused_media": { "removed": 1, "files": ["orphan.png"] }
 }
+```
+
+---
+
+## `collection_check`
+
+Report collection media-integrity issues **read-only** — the sibling of [`collection_prune`](#collection_prune). Runs Anki's media check and reports what it finds without changing anything. Use it to preview unused media before pruning, or to discover broken references.
+
+### Parameters
+
+None.
+
+### Response
+
+```jsonc
+{
+  "media_dir": "/path/to/collection.media",
+  "unused": ["orphan.png"],            // on disk, referenced by no note (prune candidates)
+  "missing": ["ghost.jpg"],            // referenced by a note, absent from the media folder
+  "missing_media_notes": [1700000000123],  // note IDs with a missing reference
+  "have_trash": false                  // whether Anki's media trash holds anything
+}
+```
+
+---
+
+## `store_media`
+
+Store media files in the collection's media folder (1–10 per call) — the write path for authoring cards with images or audio. Each item provides exactly one source: base64 `data` (which **requires** a `filename` with an extension, since the bytes alone don't say what the file is) or a `url` the server fetches (filename derived from the URL or its `Content-Type` if you omit it). After storing, reference the returned `filename` in a note field (`<img src="NAME">` or `[sound:NAME]`).
+
+URL fetches are restricted to `http`/`https` and **refuse any non-globally-routable address by default** (an SSRF guard that allowlists public IPs and re-checks each redirect hop; override with the server's `--allow-private-media-fetch` flag or `SHRIKE_MEDIA_ALLOW_PRIVATE_FETCH=1`). To store a **local** file, use the CLI `shrike media store PATH`, which reads it and sends the bytes — this tool takes no server-local path.
+
+Anki resolves name collisions: identical content keeps the name (reported `deduped: true`), different content under the same name gets a hashed suffix — so the stored `filename` may differ from what you asked for. Per-item errors (bad base64, unfetchable/blocked URL, oversize) are reported per item and don't sink the batch.
+
+### Parameters
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `items` | `object[]` | **yes** | 1–10 media items. Each: exactly one of `data` (base64 string) or `url` (string), plus `filename` (string; required with `data`, optional with `url`). |
+
+### Response
+
+```jsonc
+{
+  "results": [
+    { "status": "stored", "index": 0, "filename": "cell.png", "mime": "image/png", "size_bytes": 20481, "deduped": false },
+    { "status": "error", "index": 1, "filename": "bad.png", "error": "Only base64 data is allowed" }
+  ]
+}
+```
+
+---
+
+## `fetch_media`
+
+Locate media files in the collection (1–10 per call). **It never returns the bytes** — base64 in a tool response is useless to a model (it can't render or display it) and wrecks context. Each present file comes back as `found` with a `url` (the server's `GET /media/<name>` endpoint) and a server-side `path`; a non-existent file is `missing`. **To get the actual bytes, GET the `url`** with your download/fetch tool, or read `path` if you share the server's disk. Every `found` file reports `url`, `path`, `mime`, and `size_bytes`.
+
+### Parameters
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `filenames` | `string[]` | **yes** | 1–10 media filenames to look up. |
+
+### Response
+
+```jsonc
+{
+  "results": [
+    { "status": "found", "filename": "cell.png", "url": "http://127.0.0.1:8372/media/cell.png", "path": "/…/collection.media/cell.png", "mime": "image/png", "size_bytes": 20481 },
+    { "status": "missing", "filename": "nope.png" }
+  ]
+}
+```
+
+The `url` is the server's media endpoint — `GET /media/{filename}` streams the raw bytes with the right `Content-Type`. It's read-only and behind the same Host/Origin guard as the other custom routes. `url` is `null` only when the server didn't advertise a base URL (e.g. the library is used without a running HTTP server). The standalone client offers `ShrikeClient.read_media(name) -> bytes` for programmatic byte access (it GETs this endpoint).
+
+---
+
+## `list_media`
+
+List filenames in the collection's media folder (with the folder path), optionally filtered by a glob `pattern`. Each file carries a `url` (`GET /media/<name>`) so you can fetch its bytes directly. Covers anki-connect's `getMediaFilesNames` and `getMediaDirPath`.
+
+### Parameters
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `pattern` | `string` | no | Glob to filter filenames (e.g. `"*.png"`, `"cell-*"`). |
+| `limit` | `integer` | no | Maximum filenames to return (`count` still reflects the full total). Default `100`. |
+
+### Response
+
+```jsonc
+{
+  "media_dir": "/path/to/collection.media",
+  "count": 2,
+  "files": [
+    { "filename": "a.png", "url": "http://127.0.0.1:8372/media/a.png", "mime": "image/png", "size_bytes": 20481 },
+    { "filename": "b.ogg", "url": "http://127.0.0.1:8372/media/b.ogg", "mime": "audio/ogg", "size_bytes": 9123 }
+  ]
+}
+```
+
+---
+
+## `delete_media`
+
+Delete media files by name, moving them to Anki's media **trash** (recoverable, sync-aware). It does **not** check whether a note still references the file, so removing a referenced asset leaves a broken `<img>`/`[sound:]` — use [`collection_check`](#collection_check) to find unused media first.
+
+### Parameters
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `filenames` | `string[]` | **yes** | Media filenames to delete (1–1000). |
+
+### Response
+
+```jsonc
+{ "deleted": ["old.png"], "not_found": ["never.png"] }
 ```
 
 ---

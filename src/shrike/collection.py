@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import base64
 import contextlib
+import fnmatch
+import ipaddress
 import logging
+import mimetypes
+import os
 import re
+import socket
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any, Literal, TypeVar
+from urllib.parse import urlparse
 
 from anki.collection import Collection
 from anki.consts import MODEL_CLOZE
@@ -40,6 +47,122 @@ class CollectionBusyError(Exception):
 logger = logging.getLogger("shrike.collection")
 
 OnDuplicate = Literal["error", "skip", "allow"]
+
+# -- media (#70) -------------------------------------------------------------
+# fetch_media never returns bytes — base64 in a tool response is useless to a
+# model and wrecks context; callers get a `url` (the server's GET /media/<name>)
+# or a `path` and fetch the bytes from there. MEDIA_MAX_BYTES is the hard ceiling
+# on a single stored / downloaded file; URL_FETCH_TIMEOUT bounds a server-side
+# URL store.
+MEDIA_MAX_BYTES = 64 * 1024 * 1024
+URL_FETCH_TIMEOUT = 30.0
+
+
+def _guess_mime(filename: str) -> str | None:
+    """Best-effort MIME from a filename's extension (None for unknown)."""
+    return mimetypes.guess_type(filename)[0]
+
+
+def _decode_media_b64(data: str) -> bytes:
+    """Decode base64 media bytes, capping on the *encoded* length first.
+
+    base64 is ~4/3 the size of its payload, so the encoded string length bounds
+    the decoded size — checking it up front avoids allocating an oversize payload
+    only to reject it post-decode. Runs in a worker thread (CPU-bound)."""
+    if len(data) > (MEDIA_MAX_BYTES // 3) * 4 + 4:
+        raise ValueError(f"data exceeds the {MEDIA_MAX_BYTES}-byte limit")
+    return base64.b64decode(data, validate=True)
+
+
+def _safe_media_name(name: str) -> str:
+    """Reduce a caller-supplied name to a bare basename inside the media dir.
+
+    Strips any directory components, so ``../../etc/passwd`` becomes ``passwd`` and
+    can only ever resolve inside ``col.media.dir()`` — the path-traversal guard for
+    fetch/delete. Returns "" for a name that is only separators/dots.
+    """
+    base = os.path.basename(name.replace("\\", "/").rstrip("/"))
+    return "" if base in ("", ".", "..") else base
+
+
+MAX_MEDIA_REDIRECTS = 5
+
+
+def _check_public_address(host: str) -> None:
+    """Raise ValueError unless every address ``host`` resolves to is globally routable.
+
+    SSRF guard for server-side URL fetches. An **allowlist** (``is_global``) rather
+    than a hand-rolled denylist: it rejects loopback, RFC1918, link-local
+    (incl. the cloud-metadata IP), reserved, unspecified, **and** carrier-grade
+    NAT (100.64/10) / benchmarking / `192.0.0.0/24` ranges that a denylist misses
+    — while still permitting public hosts (8.8.8.8, 1.1.1.1, …). Multicast is
+    rejected explicitly because ``is_global`` is True for 224.0.0.0/4. Reject if
+    *any* resolved address is disallowed, so a name can't smuggle an internal A
+    record alongside a public one.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise ValueError(f"could not resolve host '{host}': {e}") from e
+    for info in infos:
+        addr = ipaddress.ip_address(info[4][0])
+        if not addr.is_global or addr.is_multicast:
+            raise ValueError(f"refusing to fetch from non-public address {addr} (host '{host}')")
+
+
+def _fetch_media_url(
+    url: str,
+    *,
+    allow_private: bool,
+    max_bytes: int = MEDIA_MAX_BYTES,
+    timeout: float = URL_FETCH_TIMEOUT,
+) -> tuple[bytes, str | None]:
+    """Download ``url`` into memory, returning (bytes, content_type).
+
+    Off the worker thread (network I/O): callers run it via ``asyncio.to_thread``
+    so a 30s fetch never blocks collection ops. Scheme is restricted to http/https,
+    the body is capped at ``max_bytes``, and httpx honors proxy env vars
+    (``trust_env``; SOCKS needs the optional ``httpx[socks]`` extra).
+
+    Redirects are followed **manually** with the SSRF guard re-run on every hop's
+    host (httpx's ``follow_redirects`` would jump to an attacker-chosen
+    private/metadata address without re-checking), capped at ``MAX_MEDIA_REDIRECTS``.
+    The residual resolve-then-connect gap (DNS rebinding) is a tracked follow-up —
+    closed by pinning the connection to the vetted IP.
+    """
+    import httpx
+
+    with httpx.Client(follow_redirects=False, timeout=timeout, trust_env=True) as client:
+        for _hop in range(MAX_MEDIA_REDIRECTS + 1):
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                raise ValueError(f"unsupported URL scheme: {parsed.scheme or '(none)'}")
+            if not parsed.hostname:
+                raise ValueError("URL has no host")
+            if not allow_private:
+                _check_public_address(parsed.hostname)
+
+            with client.stream("GET", url) as resp:
+                if resp.is_redirect:
+                    location = resp.headers.get("location")
+                    if not location:
+                        raise ValueError("redirect response without a Location header")
+                    url = str(resp.url.join(location))  # resolve relative, re-check next loop
+                    continue
+                resp.raise_for_status()
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(f"download exceeds the {max_bytes}-byte limit")
+                    chunks.append(chunk)
+                content_type = (resp.headers.get("content-type") or "").split(";")[
+                    0
+                ].strip() or None
+                return b"".join(chunks), content_type
+    raise ValueError(f"too many redirects (>{MAX_MEDIA_REDIRECTS})")
+
 
 # Anki's note.fields_check() failures that are *not* duplicates — these are
 # structural problems with the note itself and are always rejected (no policy
@@ -173,7 +296,10 @@ class CollectionWrapper:
         hold_seconds: float = DEFAULT_LOCK_HOLD,
         on_acquire: Callable[[Collection], None] | None = None,
     ) -> None:
-        self._path = path
+        # Absolutize once at construction (cwd is the daemon's startup dir): every
+        # downstream use — opening the collection, the lock-free media_dir — is then
+        # cwd-independent by construction, not merely by the daemon never chdir'ing.
+        self._path = os.path.abspath(path)
         self._closed = False
         self._cooperative = cooperative
         self._hold = hold_seconds
@@ -210,6 +336,19 @@ class CollectionWrapper:
     def is_open(self) -> bool:
         """Whether the collection is currently held open (vs idle-released)."""
         return self._open_flag
+
+    @property
+    def media_dir(self) -> str:
+        """The media folder path, derived from the collection path — **lock-free**.
+
+        Computed via Anki's ``media_paths_from_col_path`` (the dir is always
+        ``<stem>.media`` next to the collection), so the static media HTTP route
+        can resolve files without acquiring the collection (no CollectionBusyError
+        under cooperative locking). Absolute because ``self._path`` is absolutized
+        in ``__init__`` — matches ``col.media.dir()`` and is cwd-independent."""
+        from anki.media import media_paths_from_col_path
+
+        return media_paths_from_col_path(self._path)[0]
 
     # -- execution primitives ------------------------------------------------
 
@@ -1267,6 +1406,7 @@ class CollectionWrapper:
         unused_tags: bool,
         empty_notes: bool,
         empty_cards: bool,
+        unused_media: bool,
         dry_run: bool,
     ) -> tuple[dict[str, Any], list[int]]:
         return await self.run(
@@ -1274,9 +1414,14 @@ class CollectionWrapper:
                 unused_tags=unused_tags,
                 empty_notes=empty_notes,
                 empty_cards=empty_cards,
+                unused_media=unused_media,
                 dry_run=dry_run,
             )
         )
+
+    def _find_unused_media(self) -> list[str]:
+        """Media files on disk that no note references (Anki's media check)."""
+        return list(self.col.media.check().unused)
 
     def _find_empty_notes(self) -> list[int]:
         """Note ids whose every field is blank (no text and no media).
@@ -1299,14 +1444,16 @@ class CollectionWrapper:
         unused_tags: bool,
         empty_notes: bool,
         empty_cards: bool,
+        unused_media: bool,
         dry_run: bool,
     ) -> tuple[dict[str, Any], list[int]]:
         """Run the requested cleanups; return (result, note ids removed).
 
         On apply the cleanups run in order — empty notes, then empty cards, then
-        unused tags — so tag-registry names orphaned by the deletions get cleared
-        in the same call. The returned note-id list (empty notes + empty cards
-        that lost their last card) is what the tool layer removes from the index.
+        unused tags, then unused media — so tag-registry names and media files
+        orphaned by the deletions get cleared in the same call. The returned
+        note-id list (empty notes + empty cards that lost their last card) is what
+        the tool layer removes from the index; trashing media touches no vectors.
 
         Dry-run mutates nothing and computes each cleanup against the *current*
         collection; the empty-cards preview subtracts the empty-note ids (those
@@ -1347,6 +1494,17 @@ class CollectionWrapper:
                 self.col.tags.clear_unused_tags()
             result["unused_tags"] = {"removed": len(names), "tags": names}
 
+        if unused_media:
+            # Last, so on apply it catches media orphaned by the note/card deletions
+            # above (Anki's check re-reads the post-deletion reference set). Like
+            # unused_tags, the dry-run preview reflects the *current* references, so
+            # an apply may trash a few more than the preview showed. Trashing media
+            # changes no note text or note set, so the index is untouched.
+            media_files = self._find_unused_media()
+            if not dry_run and media_files:
+                self.col.media.trash_files(media_files)
+            result["unused_media"] = {"removed": len(media_files), "files": media_files}
+
         return result, removed_note_ids
 
     def _unused_tag_names(self) -> list[str]:
@@ -1365,6 +1523,190 @@ class CollectionWrapper:
                 for i in range(1, len(parts) + 1):
                     used.add("::".join(parts[:i]))
         return [t for t in self.col.tags.all() if t.lower() not in used]
+
+    # -- media (#70) ---------------------------------------------------------
+
+    async def store_media(
+        self, items: list[dict[str, Any]], *, allow_private_fetch: bool
+    ) -> list[dict[str, Any]]:
+        """Store a batch of media files; one bad item never sinks the batch.
+
+        Each item is prepared **off the worker thread** and **concurrently**
+        (``asyncio.gather`` over ``to_thread``): URL items download in parallel
+        (so a 10-URL batch isn't serialized at the per-fetch timeout) and base64
+        items decode off the event loop, with the size cap applied to the encoded
+        length *before* decoding (no allocating an oversize payload to then reject
+        it). The prepared bytes are written on the worker thread. Per-item failures
+        (bad base64, unfetchable/SSRF-blocked URL, oversize) become error results.
+        """
+
+        async def _prepare(index: int, item: dict[str, Any]) -> dict[str, Any]:
+            name = item.get("filename")
+            try:
+                if item.get("data") is not None:
+                    raw = await asyncio.to_thread(_decode_media_b64, item["data"])
+                    return {"index": index, "raw": raw, "name": name, "content_type": None}
+                url = item["url"]
+                raw, content_type = await asyncio.to_thread(
+                    _fetch_media_url, url, allow_private=allow_private_fetch
+                )
+                return {
+                    "index": index,
+                    "raw": raw,
+                    "name": name or _safe_media_name(urlparse(url).path),
+                    "content_type": content_type,
+                }
+            except Exception as e:
+                return {"index": index, "error": str(e), "name": name}
+
+        prepared = await asyncio.gather(*(_prepare(i, item) for i, item in enumerate(items)))
+        return await self.run(lambda _c: self._write_media_batch(list(prepared)))
+
+    def _write_media_batch(self, prepared: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        for p in prepared:
+            if "error" in p:
+                results.append(
+                    {
+                        "status": "error",
+                        "index": p["index"],
+                        "filename": p["name"],
+                        "error": p["error"],
+                    }
+                )
+                continue
+            try:
+                results.append(self._write_one_media(p))
+            except Exception as e:
+                results.append(
+                    {
+                        "status": "error",
+                        "index": p["index"],
+                        "filename": p.get("name"),
+                        "error": str(e),
+                    }
+                )
+        return results
+
+    def _write_one_media(self, p: dict[str, Any]) -> dict[str, Any]:
+        raw: bytes = p["raw"]
+        name: str | None = p["name"]
+        content_type: str | None = p["content_type"]
+        if len(raw) > MEDIA_MAX_BYTES:
+            raise ValueError(f"file exceeds the {MEDIA_MAX_BYTES}-byte limit")
+        # Derive an extension from the HTTP type when the (URL-derived) name lacks
+        # one, so Anki's renderer knows what it is. A base64 item always has a
+        # filename with an extension (schema-enforced).
+        if (not name or "." not in os.path.basename(name)) and content_type:
+            name = self.col.media.add_extension_based_on_mime(name or "media", content_type)
+        safe = _safe_media_name(name or "")
+        if not safe:
+            raise ValueError("could not determine a filename")
+        existed = self.col.media.have(safe)
+        stored = self.col.media.write_data(safe, raw)
+        return {
+            "status": "stored",
+            "index": p["index"],
+            "filename": stored,
+            "mime": _guess_mime(stored),
+            "size_bytes": len(raw),
+            # Identical content already present → Anki kept the name, wrote nothing
+            # new. A different-content collision instead yields stored != safe.
+            "deduped": existed and stored == safe,
+        }
+
+    async def fetch_media(self, filenames: list[str]) -> list[dict[str, Any]]:
+        return await self.run(lambda _c: self._fetch_media(filenames))
+
+    def _fetch_media(self, filenames: list[str]) -> list[dict[str, Any]]:
+        """Resolve each media filename to where its bytes live — never the bytes.
+
+        A `found` result carries `path` (read directly if co-located); the tool
+        layer adds the `url` (it knows the server's base URL). The bytes are
+        fetched from that url or path, never base64'd into the response."""
+        media_dir = self.col.media.dir()
+        results: list[dict[str, Any]] = []
+        for fn in filenames:
+            safe = _safe_media_name(fn)
+            path = os.path.join(media_dir, safe) if safe else ""
+            size: int | None = None
+            if safe and os.path.isfile(path):
+                with contextlib.suppress(OSError):
+                    size = os.path.getsize(path)  # may vanish in the gap (external delete)
+            if size is None:
+                results.append({"status": "missing", "filename": fn})
+                continue
+            results.append(
+                {
+                    "status": "found",
+                    "filename": safe,
+                    "path": path,
+                    "mime": _guess_mime(safe),
+                    "size_bytes": size,
+                }
+            )
+        return results
+
+    async def list_media(self, *, pattern: str | None, limit: int | None) -> dict[str, Any]:
+        return await self.run(lambda _c: self._list_media(pattern, limit))
+
+    def _list_media(self, pattern: str | None, limit: int | None) -> dict[str, Any]:
+        media_dir = self.col.media.dir()
+        # One scandir pass yields is_file() + stat().st_size without a second stat
+        # per file; an entry that vanishes mid-scan is skipped (treated as gone).
+        entries: list[tuple[str, int]] = []
+        # media dir absent → empty listing
+        with contextlib.suppress(OSError), os.scandir(media_dir) as it:
+            for entry in it:
+                if pattern and not fnmatch.fnmatch(entry.name, pattern):
+                    continue
+                try:
+                    if entry.is_file():
+                        entries.append((entry.name, entry.stat().st_size))
+                except OSError:
+                    continue
+        entries.sort(key=lambda e: e[0])
+        count = len(entries)
+        if limit is not None:
+            entries = entries[:limit]
+        files = [
+            {"filename": name, "mime": _guess_mime(name), "size_bytes": size}
+            for name, size in entries
+        ]
+        return {"media_dir": media_dir, "count": count, "files": files}
+
+    async def delete_media(self, filenames: list[str]) -> dict[str, Any]:
+        return await self.run(lambda _c: self._delete_media(filenames))
+
+    def _delete_media(self, filenames: list[str]) -> dict[str, Any]:
+        """Move existing media files to Anki's trash (recoverable, sync-aware)."""
+        deleted: list[str] = []
+        not_found: list[str] = []
+        to_trash: list[str] = []
+        for fn in filenames:
+            safe = _safe_media_name(fn)
+            if safe and self.col.media.have(safe):
+                to_trash.append(safe)
+                deleted.append(fn)  # echo the caller's reference, like delete_decks
+            else:
+                not_found.append(fn)
+        if to_trash:
+            self.col.media.trash_files(to_trash)
+        return {"deleted": deleted, "not_found": not_found}
+
+    async def media_check(self) -> dict[str, Any]:
+        return await self.run(lambda _c: self._media_check())
+
+    def _media_check(self) -> dict[str, Any]:
+        media_dir = self.col.media.dir()
+        report = self.col.media.check()
+        return {
+            "media_dir": media_dir,
+            "unused": list(report.unused),
+            "missing": list(report.missing),
+            "missing_media_notes": [int(nid) for nid in report.missing_media_notes],
+            "have_trash": report.have_trash,
+        }
 
     # -- decks ---------------------------------------------------------------
 

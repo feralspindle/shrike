@@ -181,7 +181,9 @@ def _register_custom_routes(
     could drive ``/shutdown`` etc. through a no-preflight POST.
     """
     from starlette.requests import Request
-    from starlette.responses import JSONResponse, Response
+    from starlette.responses import FileResponse, JSONResponse, Response
+
+    from shrike.collection import _safe_media_name
 
     security_mw = TransportSecurityMiddleware(security)
 
@@ -237,6 +239,21 @@ def _register_custom_routes(
         status["collection_held"] = wrapper.is_open
 
         return JSONResponse(status)
+
+    @app.custom_route("/media/{filename:path}", methods=["GET"])
+    @_guard
+    async def handle_media(request: Request) -> Response:
+        # Serve a media file by name — the model-friendly retrieval path that
+        # fetch_media/list_media point at (no base64). Read-only; same Host/Origin
+        # guard as the other custom routes. Filename is reduced to a basename
+        # inside the media dir (traversal guard); the dir is resolved lock-free.
+        safe = _safe_media_name(request.path_params.get("filename", ""))
+        if not safe:
+            return Response(status_code=404)
+        full = os.path.join(wrapper.media_dir, safe)
+        if not os.path.isfile(full):
+            return Response(status_code=404)
+        return FileResponse(full, filename=safe)
 
     @app.custom_route("/index/rebuild", methods=["POST"])
     @_guard
@@ -479,6 +496,20 @@ def main() -> None:
         default=None,
         help="In cooperative mode, seconds to hold the collection after the last "
         f"operation before releasing it (default: {DEFAULT_LOCK_HOLD:g})",
+    )
+    parser.add_argument(
+        "--allow-private-media-fetch",
+        action="store_true",
+        help="Let store_media fetch URLs that resolve to private/loopback addresses "
+        "(off by default — the SSRF guard refuses them). Only for trusted internal "
+        "hosts. Also enabled by SHRIKE_MEDIA_ALLOW_PRIVATE_FETCH=1.",
+    )
+    parser.add_argument(
+        "--public-url",
+        default=None,
+        help="Externally-visible base URL (e.g. https://anki.example.com) used to "
+        "build media-file links in fetch_media/list_media. Set this when behind a "
+        "reverse proxy; defaults to the bind host. Also read from SHRIKE_PUBLIC_URL.",
     )
     parser.add_argument(
         "--index-save-delay",
@@ -733,7 +764,33 @@ def main() -> None:
     # Compile each tool schema's JSON Schema validator once instead of per call
     # (the SDK's jsonschema.validate rebuilds it every request — ~5.8ms/call).
     install_validator_cache()
-    register_tools(mcp, wrapper, index=index, saver=saver)
+    allow_private_media_fetch = args.allow_private_media_fetch or (
+        os.environ.get("SHRIKE_MEDIA_ALLOW_PRIVATE_FETCH", "").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    if allow_private_media_fetch:
+        logger.warning(
+            "store_media URL fetch may reach private/loopback addresses (SSRF guard off)"
+        )
+    # Base URL for media-file links in fetch_media/list_media results. Behind a
+    # reverse proxy the bind host isn't reachable, so `--public-url` (or env)
+    # overrides it with the externally-visible origin. Otherwise derive from the
+    # bind host — a wildcard bind (0.0.0.0/::) isn't connectable, so advertise
+    # loopback there.
+    public_url = args.public_url or os.environ.get("SHRIKE_PUBLIC_URL") or ""
+    if public_url:
+        media_base_url = public_url.rstrip("/")
+    else:
+        url_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
+        media_base_url = f"http://{url_host}:{args.port}"
+    register_tools(
+        mcp,
+        wrapper,
+        index=index,
+        saver=saver,
+        allow_private_fetch=allow_private_media_fetch,
+        media_base_url=media_base_url,
+    )
     _register_custom_routes(
         mcp,
         wrapper,

@@ -28,7 +28,7 @@ src/shrike/                       # Python package (src layout)
 ├── collection.py                 # CollectionWrapper — all Anki DB operations
 ├── note_types.py                 # upsert_note_types() — create/update note types
 ├── daemon.py                     # Daemon lifecycle — file locks, spawn, shutdown
-├── tools.py                      # Registers 19 MCP tools; returns response models (emits outputSchema)
+├── tools.py                      # Registers 24 MCP tools; returns response models (emits outputSchema)
 ├── schemas.py                    # Pydantic models — single source of truth for every tool request/response + status shape
 ├── client.py                     # ShrikeClient — standalone HTTP client; typed per-tool methods, daemon lifecycle
 ├── paths.py                      # Platform-canonical directories (via platformdirs)
@@ -47,10 +47,11 @@ src/shrike/                       # Python package (src layout)
     ├── note_cmd.py               # shrike note list/show/create/update/tag/delete/search
     ├── tag_cmd.py                # shrike tag rename (collection-level tag ops)
     ├── deck_cmd.py               # shrike deck create/rename/delete
+    ├── media_cmd.py              # shrike media store/fetch/list/delete
     ├── type_cmd.py               # shrike type list/show/create/update/delete
     └── output.py                 # Rich formatting, output_options decorator
 tests/
-├── unit/                         # 570 tests — direct calls, no server
+├── unit/                         # direct calls, no server
 │   ├── conftest.py               # wrapper fixture (temp collection), basic_note fixture
 │   ├── test_collection_info.py
 │   ├── test_list_notes.py
@@ -66,11 +67,13 @@ tests/
 │   ├── test_tools_search.py     # search_notes, upsert neighbors, delete index updates
 │   ├── test_server_security.py  # loopback guard + transport-security helpers
 │   ├── test_daemon.py           # stop_server HTTP→SIGTERM→SIGKILL escalation
-│   └── test_collection_concurrency.py  # single-worker-thread serialization
-└── integration/                  # 206 tests — real server subprocess + HTTP transport
+│   ├── test_collection_concurrency.py  # single-worker-thread serialization
+│   └── test_media.py            # media store/fetch/list/delete, SSRF guard, prune unused_media (mocked URL fetch)
+└── integration/                  # real server subprocess + HTTP transport
     ├── conftest.py               # shared session server + per-test collection reset; mcp/runner; isolated_server
     ├── test_tools.py
     ├── test_cli.py
+    ├── test_media.py             # media tools + `shrike media`/`collection check` (isolated; media isn't reset-tracked)
     ├── test_security.py          # custom-route Host/Origin guard + non-loopback refusal
     ├── test_embedding.py         # Embedding tests + orphan reaping (requires llama-server + GGUF model)
     └── test_semantic.py          # Semantic search, neighbors, index CLI (requires llama-server)
@@ -198,7 +201,7 @@ The server uses FastMCP with streamable HTTP transport (`stateless_http=True`, `
 
 **OAuth is required for native connectors (deferred; tracked here).** Claude Desktop / claude.ai *URL connectors* require OAuth 2.1 + Dynamic Client Registration: they try to register against the MCP server's sign-in service and fail against an unauthenticated endpoint, regardless of TLS or network exposure. So the "run Shrike behind a reverse proxy / on a VPN and add it as a connector" story depends on implementing MCP server auth (`mcp.server.auth`, OAuth 2.0 + PKCE — see audit §1.1); it's a v0.4/v0.6-class project, intentionally not started. Until then the unauthenticated + network-boundary model serves CLI / programmatic / `mcp-remote` clients: a native client reaches Shrike through the **`mcp-remote` stdio bridge** (`npx mcp-remote http://127.0.0.1:8372/mcp --allow-http --transport http-only`), which connects without auth because Shrike demands none. This is how the QA harness drives Claude Desktop.
 
-### MCP tools (19 total)
+### MCP tools (24 total)
 
 | Tool | Status | Purpose |
 |------|--------|---------|
@@ -220,7 +223,12 @@ The server uses FastMCP with streamable HTTP transport (`stateless_http=True`, `
 | `delete_decks` | Working | Delete decks by name, only if empty (else reported `not_empty`) |
 | `delete_notes` | Working | Permanently delete notes by ID |
 | `delete_note_types` | Working | Delete note types by ID (only if unused) |
-| `collection_prune` | Working | Cleanup: unused tags + empty notes + empty cards; `dry_run` default **true** (preview) |
+| `collection_prune` | Working | Cleanup: unused tags + empty notes + empty cards + unused media; `dry_run` default **true** (preview) |
+| `collection_check` | Working | Read-only media diagnostics: unused/missing media, missing-media notes, trash state |
+| `store_media` | Working | Store media (1-10) from base64 `data` or `url` (SSRF-guarded); per-item results; dedup/collision via Anki |
+| `fetch_media` | Working | Locate media (1-10); per-item `found`(url+path+mime+size)/`missing` union — **never returns bytes** (GET the `url`) |
+| `list_media` | Working | List media filenames (+ `media_dir`), optional glob `pattern`; each with `url`/`mime`/`size_bytes` |
+| `delete_media` | Working | Delete media by name → Anki's recoverable trash (no ref-check); `deleted`/`not_found` |
 
 **Duplicate handling lives *inside* `upsert_notes`, not in a separate pre-check (#77).** Before each new note is written, Anki's own add-note validation (`note.fields_check()`, via `CollectionWrapper._check_new_note`) runs. A first-field duplicate (same first field as an existing note of that type — Anki's rule, collection-wide and **deck-independent**) is governed by the `on_duplicate` param: `error` (**default** — reported, not written), `skip` (`status: skipped`), or `allow` (written anyway). Structurally invalid notes — empty first field, broken cloze — are *always* reported as errors with a `reason` regardless of policy, and never written. `dry_run: true` runs the exact same validation but writes nothing: every result is `ok` (with `action: create|update`), `skipped`, or `error`, and the response echoes `dry_run: true` — so `dry_run` + the default policy is a full `fields_check`-based sanity pass over a batch. The per-item result union (`UpsertNoteResult` in `schemas.py`) carries the four variants (`UpsertNoteOk` / `UpsertNoteValidated` / `UpsertNoteSkipped` / `UpsertNoteError`, discriminated on `status`); `UpsertNoteError.reason` is the machine-readable `NoteValidationReason`. This is Anki's *exact* first-field rule, distinct from the *semantic* near-duplicate signal the returned `neighbors` provide. A standalone `canAddNotes`-style tool was rejected: it would be racy (check-then-write) and only actionable by a follow-up call (see `docs/decisions.md`). Note the validation applies to **creates**; updates are validated for existence/fields but not duplicate/empty. `dry_run` does not catch intra-batch duplicates (it writes nothing, so two identical new notes in one call both validate clean — a real run catches the second).
 
@@ -228,7 +236,9 @@ The server uses FastMCP with streamable HTTP transport (`stateless_http=True`, `
 
 The tag tools (#73), deck tools (#74), `find_replace_note_types` (#76), **and** `update_note_type_field_metadata` (#119) are a derived-index-aware special case: tags, deck names, a note type's template/CSS text, and per-field editor metadata (font/size/description) are **not** part of a note's embedding text, so these ops leave every vector valid but bump `col.mod`. Each advances the stored `index.col_mod` (and requests a debounced save) **without** re-embedding — via the shared `_bump_col_mod_after_metadata_change` helper in `tools.py` — so such a metadata-only change doesn't force a spurious full rebuild on next startup. Full-replace of tags lives in both `update_note_tags` (`set`) and incidentally in `upsert_notes` (`{id, tags}`); the additive/subtractive logic lives only in `update_note_tags`. `upsert_decks` mirrors `upsert_notes` (id present = rename the existing deck; absent = create); **decks never merge** — renaming onto an existing deck name is an error, and `delete_decks` is **empty-only** (move notes out first), so deck deletion can never delete a note.
 
-**Collection maintenance is one tool, `collection_prune` (#89), not scattered cleanups.** It runs any of three cleanups — clear **unused tags** (`tags.clear_unused_tags`), remove **empty notes**, remove **empty cards** (`get_empty_cards` → `remove_cards_and_orphaned_notes`); selecting none runs all. It is **preview-by-default**: `dry_run` defaults **true** (unlike `find_replace_notes`, which applies by default — prune is collection-wide and deletes notes/cards, so it errs the safe way; the CLI `shrike collection prune` previews unless `--apply`). The earlier standalone `clear_unused_tags`/`shrike tag clean` (#73) was removed (#90) to land here, and this supersedes a standalone remove-empty-notes (#78). An **empty note** is one whose every field is blank by `embed_text.field_is_blank` — no text *and* no media (`<img|audio|video|object|embed|source>`/`[sound:]`), so an image- or audio-only note is never deleted. Index handling is **mixed**, which is why this isn't a pure metadata-bump op like the tag/deck ones: empty-note and empty-card removal **delete notes**, so their vectors leave the index via `index.remove` exactly like `delete_notes`; clearing unused tags is vectors-unchanged. The tool does both in one pass (`index.remove(removed_note_ids)` then advance `col_mod` + save) when anything changed. On apply the order is empty notes → empty cards → unused tags, so tags freed by the deletions get cleared in the same call; the dry-run previews each cleanup independently (so an apply may clear a few more tags than the preview showed). Logic lives in `CollectionWrapper._prune`/`_find_empty_notes`; the CLI `collection` group (`cli/collection_cmd.py`) also houses `collection query` (below).
+**Collection maintenance is one tool, `collection_prune` (#89), not scattered cleanups.** It runs any of four cleanups — clear **unused tags** (`tags.clear_unused_tags`), remove **empty notes**, remove **empty cards** (`get_empty_cards` → `remove_cards_and_orphaned_notes`), trash **unused media** (`col.media.check().unused` → `trash_files`, #70); selecting none runs all. It is **preview-by-default**: `dry_run` defaults **true** (unlike `find_replace_notes`, which applies by default — prune is collection-wide and deletes notes/cards, so it errs the safe way; the CLI `shrike collection prune` previews unless `--apply`). The earlier standalone `clear_unused_tags`/`shrike tag clean` (#73) was removed (#90) to land here, and this supersedes a standalone remove-empty-notes (#78). An **empty note** is one whose every field is blank by `embed_text.field_is_blank` — no text *and* no media (`<img|audio|video|object|embed|source>`/`[sound:]`), so an image- or audio-only note is never deleted. Index handling is **mixed**, which is why this isn't a pure metadata-bump op like the tag/deck ones: empty-note and empty-card removal **delete notes**, so their vectors leave the index via `index.remove` exactly like `delete_notes`; clearing unused tags and trashing unused media are vectors-unchanged (media isn't embedding text). The tool does both in one pass (`index.remove(removed_note_ids)` then advance `col_mod` + save) when anything changed. On apply the order is empty notes → empty cards → unused tags → unused media, so tags and media freed by the deletions get cleared in the same call; the dry-run previews each cleanup independently (so an apply may clear a few more than the preview showed). Logic lives in `CollectionWrapper._prune`/`_find_empty_notes`/`_find_unused_media`; the CLI `collection` group (`cli/collection_cmd.py`) also houses `collection query`, `collection check`, and `collection reload`. The read-only sibling **`collection_check`** (#70) wraps `col.media.check()` to report `unused`/`missing`/`missing_media_notes`/`have_trash` without mutating — the place to inspect media issues (and the home for future bookkeeping checks).
+
+**Media files are first-class, via five tools (#70), and orthogonal to the vector index.** `store_media`/`fetch_media`/`list_media`/`delete_media` wrap `col.media` (`write_data`/`add_file`, the media-dir read, `trash_files`); media ops **never touch `col.mod` or embedding text** (verified), so unlike the tag/deck metadata ops they need *no* `index.col_mod` bump at all — the index is simply unconcerned. The authoring write path is `store_media`: a bulk (1-10) per-item batch where each item is base64 `data` (requires a `filename` with extension — the type carrier, since bytes are opaque) **or** a `url` the server fetches; one item failing (bad base64, blocked URL, oversize) doesn't sink the batch (per-item `StoreMediaOk`/`StoreMediaError` union). **No server-local `path` input** on the tool (a remote client must not read the server's disk) — the CLI `shrike media store PATH` reads the file and uploads bytes instead, so it works against any daemon. Anki resolves collisions (identical content → same name, reported `deduped`; different content → hashed suffix), so callers must use the *returned* filename. **URL fetch is SSRF-guarded** (`_fetch_media_url` in `collection.py`): http/https only; the host is resolved and refused unless every address is **globally routable** (`ipaddress.is_global` — an *allowlist*, so it also rejects carrier-grade NAT 100.64/10, `192.0.0.0/24`, benchmarking ranges a denylist misses, plus loopback/RFC1918/link-local/metadata/reserved/multicast) — unless `--allow-private-media-fetch` / `SHRIKE_MEDIA_ALLOW_PRIVATE_FETCH` / config `server.media_allow_private_fetch` (threaded through `register_tools(..., allow_private_fetch=)` and `ServerSpec`). **Redirects are followed manually, re-running the guard on every hop's host** (capped at `MAX_MEDIA_REDIRECTS`), because httpx's `follow_redirects` would jump to an attacker-chosen private/metadata address unchecked. Each item is prepared **concurrently and off the worker thread** (`asyncio.gather` over `to_thread`: URL downloads overlap, base64 decodes off the event loop with the size cap applied to the *encoded* length before decoding); honors httpx proxy env (SOCKS via the optional `httpx[socks]` extra); capped at `MEDIA_MAX_BYTES`. Residual known limitation: the resolve-then-connect gap is a DNS-rebinding TOCTOU (the redirect bypass is closed; pinning the connection to the vetted IP closes rebinding too — tracked follow-up). `fetch_media` **never returns bytes** — base64 in a tool response is useless to a model (it can't render it) and wrecks context. Each present file returns as `MediaFile` (`status: "found"`) carrying a **`url`** (the server's `GET /media/<name>`) + server-side `path`; the model GETs the url with its own download/fetch tool (no base64) or reads the path if co-located, and a missing file is `MediaMissing`. There is **no inline/base64 option** — the only way to bytes is the url (or path). The `url` is built in the tool layer (`_media_url`, from a `media_base_url` threaded into `register_tools`; `list_media` carries it too). `media_base_url` defaults to the bind host but is overridable for reverse-proxy deployments via `--public-url` / `SHRIKE_PUBLIC_URL` / config `server.public_url` (the bind host isn't externally reachable behind a proxy). The **`GET /media/{filename}`** custom route (in `_register_custom_routes`, behind the same `_guard` Host/Origin check, `FileResponse`) serves the bytes and resolves the media dir **lock-free and absolutized** via `CollectionWrapper.media_dir` (`media_paths_from_col_path`, no CollectionBusyError; abspath'd so a relative `--collection` doesn't make the route cwd-dependent). For programmatic byte access the standalone client has `ShrikeClient.read_media(name) -> bytes` (GETs that route). `list_media` defaults to 100 files. fetch/delete and the route sanitize filenames to a basename inside the media dir (`_safe_media_name`, traversal guard). The future multimodal-embedding epic (search media by content, #162) builds *on top of* this store path. Logic lives in `CollectionWrapper.store_media/fetch_media/list_media/delete_media/media_check`; CLI in `cli/media_cmd.py` (which downloads a found file's `url` or copies its `path`).
 
 **Three retrieval surfaces, by intent.** `list_notes` is structured filters (deck/tags/type/ids/date, ANDed); `search_notes` is meaning + exact text (semantic + substring, annotated); `collection_query` (#97) is the **raw Anki escape hatch** — the string goes straight to `col.find_notes`, so the full expression language works (`is:due`, `prop:ivl>=30`, `added:`, `rated:`, `flag:`, `nid:`/`cid:`, `OR`/`-`/brackets). It exists because #86 removed `note list --query` (the leaky raw param) in favour of an explicit tool. It is **read-only** — it only *finds* notes; `is:due`/`rated:` filters return matching notes but perform no review or scheduling, so the full grammar is allowed without a whitelist to police. It reuses `list_notes`' serialization (`_note_to_dict`) and `ListNotesResponse`; a malformed expression raises `anki.errors.SearchError`, which the tool maps to `ToolInputError` (stripping Anki's U+2068/U+2069 isolation marks). Lives in `CollectionWrapper._query`.
 
@@ -254,7 +264,8 @@ shrike [--config PATH] [--url URL] [--json] [--pretty/--no-pretty]
 ├── deck create|rename|delete
 ├── tag rename
 ├── type list|show|create|update|delete
-├── collection query|prune|reload
+├── media store|fetch|list|delete
+├── collection query|prune|check|reload
 ├── index rebuild|status|save
 └── embedding status|start|stop
 ```
@@ -289,6 +300,7 @@ Signal handlers (SIGTERM, SIGINT) remain as a secondary path for Unix `kill` com
 
 **HTTP endpoints** beyond MCP:
 - `GET /status` — returns JSON with pid, url, collection, log_level, log_dir, uptime, embedding, index, and the collection-lock state (`locking`: permanent/cooperative, `collection_held`: bool). Used by `shrike server status` and auto-start health checks.
+- `GET /media/{filename}` — streams a media file (`FileResponse`, content-type from extension) so `fetch_media`/`list_media` can hand back a `url` instead of base64 (#70). Read-only, behind the `_guard` Host/Origin check; filename basename-sanitized; the media dir is resolved lock-free (`wrapper.media_dir`). 404 for a missing/escaping name.
 - `POST /shutdown` — triggers graceful server shutdown.
 - `POST /index/rebuild` — triggers a full index rebuild (returns immediately with status/progress). Requires the embedding service to be running.
 - `POST /index/save` — forces an immediate flush of the in-memory index to disk (off the event loop). Returns `saved` (with `size` and the `pending` count it flushed), `empty` (no index built yet), or `building` (refused mid-rebuild). Backs `shrike index save`; the index also saves automatically (debounced flush + shutdown).
@@ -316,7 +328,7 @@ On Linux, XDG env vars (`XDG_CONFIG_HOME`, `XDG_STATE_HOME`, etc.) are respected
 
 ### Config file
 
-YAML at the platform config directory (`config.yml`). **User-managed: `shrike server start` never writes it unless `--save-config` is passed** (#56). With `--save-config`, start persists the resolved flags (the `embedding` section, including the model path, is written there too) so later runs and `shrike embedding start` pick them up; without it, start is a no-write operation and always reflects exactly the flags it was given. (The old behaviour wrote the file once on first run and then silently ignored later flags — the divergence that was the #56 bug.) Resolution order: config defaults → config values → env vars (`SHRIKE_URL`, `SHRIKE_COLLECTION`, `SHRIKE_EMBEDDING_MODEL`, `SHRIKE_EMBEDDING_PORT`, `SHRIKE_EMBEDDING_POOLING`, `SHRIKE_EMBEDDING_ARGS`, `LLAMA_SERVER_PATH`, `SHRIKE_CACHE_DIR`, `SHRIKE_INDEX_SAVE_DELAY`, `SHRIKE_INDEX_SAVE_THRESHOLD`, `SHRIKE_COOPERATIVE_LOCK`, `SHRIKE_LOCK_HOLD_SECONDS`) → CLI flags. Embedding params follow the same cascade via `config.resolve_embedding()`, shared by `shrike server start` and `shrike embedding start`; the index cache dir and flush tuning follow it via `config.resolve_cache_dir()` / `config.resolve_index_save()`. `save_config` persists `collection`, `cache_dir`, non-default `server.*`, `embedding.*`, and any set `index.save_delay` / `index.save_threshold`; **logging overrides are read from config but never written by `--save-config`** — set `logging.level` / `logging.dir` in `config.yml` directly. The `index.*` flush knobs and `cache_dir` resolve to `None` in config, meaning "use the server's built-in defaults" (`IndexSaver`'s 60s/100 and the platform cache dir) — the numeric defaults live in `shrike.index`, not duplicated in config.
+YAML at the platform config directory (`config.yml`). **User-managed: `shrike server start` never writes it unless `--save-config` is passed** (#56). With `--save-config`, start persists the resolved flags (the `embedding` section, including the model path, is written there too) so later runs and `shrike embedding start` pick them up; without it, start is a no-write operation and always reflects exactly the flags it was given. (The old behaviour wrote the file once on first run and then silently ignored later flags — the divergence that was the #56 bug.) Resolution order: config defaults → config values → env vars (`SHRIKE_URL`, `SHRIKE_COLLECTION`, `SHRIKE_EMBEDDING_MODEL`, `SHRIKE_EMBEDDING_PORT`, `SHRIKE_EMBEDDING_POOLING`, `SHRIKE_EMBEDDING_ARGS`, `LLAMA_SERVER_PATH`, `SHRIKE_CACHE_DIR`, `SHRIKE_INDEX_SAVE_DELAY`, `SHRIKE_INDEX_SAVE_THRESHOLD`, `SHRIKE_COOPERATIVE_LOCK`, `SHRIKE_LOCK_HOLD_SECONDS`, `SHRIKE_MEDIA_ALLOW_PRIVATE_FETCH`, `SHRIKE_PUBLIC_URL`) → CLI flags. Embedding params follow the same cascade via `config.resolve_embedding()`, shared by `shrike server start` and `shrike embedding start`; the index cache dir and flush tuning follow it via `config.resolve_cache_dir()` / `config.resolve_index_save()`. `save_config` persists `collection`, `cache_dir`, non-default `server.*`, `embedding.*`, and any set `index.save_delay` / `index.save_threshold`; **logging overrides are read from config but never written by `--save-config`** — set `logging.level` / `logging.dir` in `config.yml` directly. The `index.*` flush knobs and `cache_dir` resolve to `None` in config, meaning "use the server's built-in defaults" (`IndexSaver`'s 60s/100 and the platform cache dir) — the numeric defaults live in `shrike.index`, not duplicated in config.
 
 ### Embedding service lifecycle
 
@@ -409,6 +421,25 @@ working summary.
   neighbours, duplicate detection, full-replace tags) lives in
   [`docs/decisions.md`](docs/decisions.md).
 
+### Review & audit gates — mandatory
+
+These are required, not optional, and run in addition to the CI lint/test gates:
+
+- **Code review on every significant change and feature addition** before merge —
+  not trivial typo/doc/dep-bump PRs, but anything that adds or changes behaviour.
+  Use `/code-review` (escalate to `ultra` for larger changes).
+- **Security review whenever the server API surface changes** — a new/changed MCP
+  tool or custom HTTP route, auth/transport/SSRF/path handling, anything touching
+  the trust boundary. Run it *in addition* to the code review, via
+  `/security-review`.
+- **Before cutting a release**, run a fresh pair of passes over the release
+  candidate: a **security audit** and a **performance audit**. Apply the `rc`
+  label first so the cross-platform CI lane also runs (see the CI notes above).
+
+Reviews/audits are launched by the user (the `ultra`/cloud passes are billed and
+user-triggered — the agent can't start them); the agent's job is to surface that
+a change crosses one of these thresholds and to act on the findings.
+
 ### Defect workflow — follow this when you find a defect or limitation
 
 When you hit a bug, a limitation, or a missing API surface that is **out of scope
@@ -427,3 +458,14 @@ prose note. Capture it as resumable state:
 
 The failing test is the spec; the pushed branch is the handoff. See the full
 rationale in `CONTRIBUTING.md`.
+
+### Approved-plan check-in — record the plan on its home issue
+
+When the user **approves** a plan (plan mode / ExitPlanMode), post it as a comment
+on the GitHub issue it's homed in, so the issue carries the agreed design as
+resumable state. End the comment with the same attribution line used on PR bodies
+(`🤖 Generated with [Claude Code](https://claude.com/claude-code)`). Only
+*approved* plans, never drafts. **Strip notes-to-self before posting** — drop the
+process/meta sections (e.g. "Workflow updates", "Branch"); the comment carries the
+substantive plan only (context, design, surface, files, verification), not the
+scaffolding.
