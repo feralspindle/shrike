@@ -143,22 +143,85 @@ class TestRedirectRealHttpx:
         thread = threading.Thread(target=srv.serve_forever, daemon=True)
         thread.start()
         try:
-            # Allow the first hop, refuse the second — so a correct (no-autofollow)
-            # loop re-enters and raises before /internal is fetched.
+            # Allow the first hop (return its vetted IP), refuse the second — so a
+            # correct (no-autofollow) loop re-enters and raises before /internal.
             calls = {"n": 0}
 
-            def fake_check(host: str) -> None:
+            def fake_resolve(host: str) -> str:
                 calls["n"] += 1
                 if calls["n"] >= 2:
                     raise ValueError(f"refusing to fetch from non-public address (host '{host}')")
+                return host  # loopback literal — pin straight back to it
 
-            monkeypatch.setattr(collection_mod, "_check_public_address", fake_check)
+            monkeypatch.setattr(collection_mod, "_resolve_public_ip", fake_resolve)
             with pytest.raises(ValueError, match="non-public address"):
                 _fetch_media_url(f"http://127.0.0.1:{port}/start", allow_private=False)
             assert "/start" in hits
             assert "/internal" not in hits  # decisive: never fetched
         finally:
             srv.shutdown()
+
+
+class TestSniValidationRealTls:
+    """Hermetic local-TLS proof that the connection actually validates the cert
+    against the *hostname* (via the sni_hostname extension), not the dialed IP —
+    locking the crux of the IP-pinning fix against a future httpcore change that
+    renames/ignores the extension. No network: an ephemeral CA (trustme) + a
+    127.0.0.1 HTTPS server, trusted via SSL_CERT_FILE (httpx trust_env=True)."""
+
+    def _serve_tls(self, cert) -> tuple[int, object]:
+        import ssl
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # silence
+                pass
+
+            def do_GET(self):  # noqa: N802 (stdlib API)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        cert.configure_cert(ctx)
+        srv = HTTPServer(("127.0.0.1", 0), _Handler)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv.server_port, srv
+
+    def test_cert_validated_against_sni_name_not_ip(self, tmp_path, monkeypatch):
+        trustme = pytest.importorskip("trustme")
+        from shrike import collection as collection_mod
+        from shrike.collection import _fetch_media_url
+
+        ca = trustme.CA()
+        ca_pem = tmp_path / "ca.pem"
+        ca.cert_pem.write_to_path(str(ca_pem))
+        monkeypatch.setenv("SSL_CERT_FILE", str(ca_pem))  # httpx(trust_env=True) trusts our CA
+        # Pin "shrike.test" to the local server (it doesn't resolve, and 127.0.0.1
+        # would be refused by the real guard — bypass just the resolution).
+        monkeypatch.setattr(collection_mod, "_resolve_public_ip", lambda host: "127.0.0.1")
+
+        # Positive: cert covers shrike.test → SNI shrike.test validates → 200.
+        port, srv = self._serve_tls(ca.issue_cert("shrike.test"))
+        try:
+            raw, _ = _fetch_media_url(f"https://shrike.test:{port}/", allow_private=False)
+            assert raw == b"OK"
+        finally:
+            srv.shutdown()
+
+        # Negative: cert covers only other.test, but we still request (SNI) shrike.test
+        # → verification is against the *name*, so it must FAIL (if it validated the
+        # IP or had verification off, this would wrongly pass).
+        port2, srv2 = self._serve_tls(ca.issue_cert("other.test"))
+        try:
+            import httpx
+
+            with pytest.raises(httpx.ConnectError):
+                _fetch_media_url(f"https://shrike.test:{port2}/", allow_private=False)
+        finally:
+            srv2.shutdown()
 
 
 class TestMediaCLI:
