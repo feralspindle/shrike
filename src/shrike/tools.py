@@ -48,8 +48,14 @@ from shrike.schemas import (
     UpsertNotesResponse,
     UpsertNoteTypesResponse,
 )
+from shrike.search_fusion import rrf_fuse
 
 logger = logging.getLogger("shrike.tools")
+
+# Per-signal RRF weights for search_notes' fusion (#180). Equal today (semantic + exact); the
+# tuning harness + further signals (n-gram #98, tag #179, per-modality #201) will make these
+# config/`--search-*` knobs. The exact-match override (priority tier) is orthogonal to the weight.
+SEARCH_WEIGHTS = {"semantic": 1.0, "exact": 1.0}
 
 
 class ToolInputError(Exception):
@@ -409,8 +415,9 @@ def register_tools(
 
         Exact substring matches are returned even when the embedding index is
         unavailable (the response carries a `message` noting semantic ranking was
-        skipped) and are not subject to `threshold`. Within a group, matches that
-        contain the text literally are listed first, then by descending score.
+        skipped) and are not subject to `threshold`. Within a group, results are
+        ordered by Reciprocal Rank Fusion of the signals, with every literal
+        (`substring`) hit floated above non-literal ones, then by fused rank.
 
         Use this for conceptual queries keyword search can't handle and for
         finding exact wording. At least one of `queries` or `ids` is required."""
@@ -501,18 +508,25 @@ def register_tools(
 
         results: list[dict[str, Any]] = []
         for i, (kind, label, text) in enumerate(text_sources):
-            merged: dict[int, dict[str, Any]] = {}
+            # Each signal ranks its own candidates (best-first); rrf_fuse blends them by rank and
+            # the exact-match override tiers literal hits above the rest (the one place RRF's
+            # magnitude-blindness is wrong). note_data caches every in-scope candidate's full dict.
+            note_data: dict[int, dict[str, Any]] = {}
 
-            # Exact substring (query sources only; deck/tags/exclude applied inside).
+            # Literal-substring candidates (query sources only). Anki's "*term*" search is a fast,
+            # scoped pre-filter; `substring_info` (recomputed below over every candidate) is the
+            # *authority* for what counts as a literal hit — so a literal match Anki's normalized
+            # search misses (text in markup/attributes) or that fell beyond its limit is still
+            # floated, keeping the annotation and the exact tier in lockstep.
             if kind == "query":
-                exact = await wrapper.search_substring(
+                for note in await wrapper.search_substring(
                     text, deck=deck, tags=tags or None, exclude_ids=list(exclude_set), limit=top_k
-                )
-                for note in exact:
-                    merged[note["id"]] = {**note, "score": None}
+                ):
+                    note_data[note["id"]] = note
 
-            # Semantic.
-            sem_count = 0
+            # Semantic ranking (scoped, thresholded, excluded), distance-ascending.
+            sem_ids: list[int] = []
+            sem_score: dict[int, float] = {}
             for m in sem_raw.get(i, []):
                 nid = m["note_id"]
                 if nid in exclude_set:
@@ -520,33 +534,42 @@ def register_tools(
                 score = round(1.0 - m["distance"], 3)
                 if score < threshold:
                     break  # raw is distance-ascending → the rest are below threshold
-                try:
-                    note_data = await wrapper.note_to_dict(nid, "full")
-                except Exception:
-                    logger.debug("search_notes: skipping unreadable note %s", nid, exc_info=True)
-                    continue
-                if not _in_scope(note_data):
-                    continue
-                if nid in merged:
-                    merged[nid]["score"] = score
-                else:
-                    entry = {**note_data, "score": score}
-                    if kind == "query":
-                        entry["substring"] = substring_info(note_data.get("content"), text)
-                    merged[nid] = entry
-                sem_count += 1
-                if sem_count >= top_k:
+                if nid not in note_data:
+                    try:
+                        data = await wrapper.note_to_dict(nid, "full")
+                    except Exception:
+                        logger.debug(
+                            "search_notes: skipping unreadable note %s", nid, exc_info=True
+                        )
+                        continue
+                    if not _in_scope(data):
+                        continue  # out of deck/tag scope — keep it out of note_data entirely
+                    note_data[nid] = data
+                sem_ids.append(nid)
+                sem_score[nid] = score
+                if len(sem_ids) >= top_k:
                     break
 
-            # Literal hits first, then by descending score.
-            ordered = sorted(
-                merged.values(),
-                key=lambda e: (
-                    0 if e.get("substring") is not None else 1,
-                    -(e["score"] if e.get("score") is not None else -1.0),
-                ),
+            # Exact ranking = every candidate whose content literally contains the query (the
+            # `substring` annotation), so annotation ⟺ floated. Pre-filter hits already carry it.
+            exact_ids: list[int] = []
+            if kind == "query":
+                for nid, data in note_data.items():
+                    if "substring" not in data:
+                        data["substring"] = substring_info(data.get("content"), text)
+                    if data.get("substring") is not None:
+                        exact_ids.append(nid)
+
+            fused = rrf_fuse(
+                {"semantic": sem_ids, "exact": exact_ids},
+                weights=SEARCH_WEIGHTS,
+                priority_signals=frozenset({"exact"}),
             )
-            results.append({"source": label, "matches": ordered})
+
+            matches = [
+                {**note_data[hit.note_id], "score": sem_score.get(hit.note_id)} for hit in fused
+            ]
+            results.append({"source": label, "matches": matches})
 
         logger.info(
             "search_notes returned %d groups, %d total matches",
