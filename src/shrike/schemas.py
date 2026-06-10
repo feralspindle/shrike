@@ -177,6 +177,21 @@ class SubstringInfo(BaseModel):
     snippet: str | None = None
 
 
+class SignalContribution(BaseModel):
+    """One retrieval signal that contributed to a fused result, and at what rank (#182).
+
+    ``signal`` is the fusion signal's name — ``text`` / ``image`` for the per-modality semantic
+    rankers (so the name *is* the matched-modality facet: ``image`` ⇒ "matched on the image"),
+    ``exact`` for a literal substring hit, and later ``fuzzy`` (#98) / ``tag`` (#179). ``rank`` is
+    the note's 1-based position in that signal's own ranking; the signal's *unweighted* RRF term
+    (``1/(k+rank)``) is derivable from it (the per-signal fusion weight is not carried in the
+    response, so the full weighted contribution is not).
+    """
+
+    signal: str
+    rank: int
+
+
 class SearchMatch(Note):
     """A search result with per-mechanism match evidence.
 
@@ -192,6 +207,11 @@ class SearchMatch(Note):
     score: float | None = None
     # Present when the query text occurs literally in the note.
     substring: SubstringInfo | None = None
+    # Which signals surfaced this result, best (lowest) rank first (#182). Always non-empty for a
+    # returned match (it came from a fused hit). The unified provenance view over the fused ranking;
+    # `score`/`substring` above stay as the per-signal detail. `signal: "image"` is the
+    # matched-modality facet.
+    provenance: list[SignalContribution] = []
 
 
 class Neighbor(BaseModel):
