@@ -32,8 +32,12 @@ from click.testing import CliRunner
 from shrike.cli import cli
 from shrike.client import ShrikeClient
 from tests.integration.model_cache import (
+    CLIP_MODEL_DIR_NAME,
+    DISTILROBERTA_MODEL_DIR_NAME,
     EMBEDDING_MODEL_NAME,
     EMBEDDING_MODEL_URL,
+    ONNX_FP32_MODEL_DIR_NAME,
+    ONNX_MODEL_DIR_NAME,
     cached_clip_model_dir,
     cached_distilroberta_model_dir,
     cached_model_path,
@@ -50,6 +54,122 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "integration: spawns a server over HTTP")
     config.addinivalue_line("markers", "embedding: requires llama-server and a model")
 
+
+# -- Bazel: assemble the pinned model externals into a SHRIKE_TEST_MODEL_DIR tree -
+#
+# Under `bazel test`, the embedding models are pinned http_file externals (see
+# MODULE.bazel) rather than HuggingFace downloads. This copies whichever are in
+# the test's runfiles into the <dir_name>/<file> layout model_cache expects and
+# points SHRIKE_TEST_MODEL_DIR at it — so model_cache finds them present and never
+# downloads. No-op off Bazel, when SHRIKE_TEST_MODEL_DIR is already set (the pip
+# lane / CI), or for a target with no model externals (the non-embedding suite),
+# so the pip path is untouched.
+# Dest dir-names come from model_cache's *_DIR_NAME constants (not re-spelled here),
+# so a model rename there can't silently drift this map into the wrong layout — which
+# would make model_cache miss the assembled file and fall back to a HuggingFace
+# download at test time (the #83/#93 flake). Key = the http_file external's runfiles
+# path (MODULE.bazel); value = the model_cache <dir>/<file> layout it assembles into.
+_BAZEL_MODELS: dict[str, list[str]] = {
+    "model_minilm_int8_onnx/file/model.onnx": [f"{ONNX_MODEL_DIR_NAME}/model.onnx"],
+    "model_minilm_tokenizer/file/tokenizer.json": [
+        f"{ONNX_MODEL_DIR_NAME}/tokenizer.json",
+        f"{ONNX_FP32_MODEL_DIR_NAME}/tokenizer.json",
+    ],
+    "model_minilm_fp32_onnx/file/model.onnx": [f"{ONNX_FP32_MODEL_DIR_NAME}/model.onnx"],
+    "model_roberta_int8_onnx/file/model.onnx": [f"{DISTILROBERTA_MODEL_DIR_NAME}/model.onnx"],
+    "model_roberta_tokenizer/file/tokenizer.json": [
+        f"{DISTILROBERTA_MODEL_DIR_NAME}/tokenizer.json"
+    ],
+    "model_clip_text_onnx/file/text_model_quantized.onnx": [
+        f"{CLIP_MODEL_DIR_NAME}/text_model_quantized.onnx",
+    ],
+    "model_clip_vision_onnx/file/vision_model_quantized.onnx": [
+        f"{CLIP_MODEL_DIR_NAME}/vision_model_quantized.onnx",
+    ],
+    "model_clip_tokenizer/file/tokenizer.json": [f"{CLIP_MODEL_DIR_NAME}/tokenizer.json"],
+    "model_clip_preprocessor/file/preprocessor_config.json": [
+        f"{CLIP_MODEL_DIR_NAME}/preprocessor_config.json",
+    ],
+    f"model_gguf_minilm/file/{EMBEDDING_MODEL_NAME}": [EMBEDDING_MODEL_NAME],
+}
+
+# llama-server binary externals (per-platform; only the host's is in a given test's
+# runfiles). The conftest puts it on PATH (so the requires_llama_server gate and the
+# server's _find_llama_server both see it) + the lib path (the .dylib/.so sit beside
+# the binary). No-op off Bazel / when llama-server is already available (pip lane).
+_BAZEL_LLAMA_REPOS = (
+    "llama_server_macos_arm64",
+    "llama_server_macos_amd64",
+    "llama_server_linux_amd64",
+    "llama_server_linux_arm64",
+)
+
+
+def _setup_bazel_llama_server() -> None:
+    if os.environ.get("LLAMA_SERVER_PATH") or shutil.which("llama-server"):
+        return
+    if not (os.environ.get("RUNFILES_DIR") or os.environ.get("RUNFILES_MANIFEST_FILE")):
+        return
+    try:
+        from python.runfiles import runfiles
+    except ImportError:
+        return
+    r = runfiles.Create()
+    if r is None:
+        return
+    for repo in _BAZEL_LLAMA_REPOS:
+        try:
+            loc = r.Rlocation(f"{repo}/llama-server")
+        except Exception:  # noqa: BLE001 - repo not in this target's mapping
+            continue
+        if not loc or not os.path.exists(loc):
+            continue
+        bindir = os.path.dirname(loc)
+        os.environ["LLAMA_SERVER_PATH"] = loc
+        os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+        # The shared libs are flat beside the binary.
+        for var in ("DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH"):
+            os.environ[var] = bindir + os.pathsep + os.environ.get(var, "")
+        return
+
+
+_setup_bazel_llama_server()
+
+
+def _populate_bazel_model_dir() -> None:
+    if os.environ.get("SHRIKE_TEST_MODEL_DIR"):
+        return  # already provided (pip lane / CI) — respect it
+    if not (os.environ.get("RUNFILES_DIR") or os.environ.get("RUNFILES_MANIFEST_FILE")):
+        return  # not under Bazel
+    try:
+        from python.runfiles import runfiles
+    except ImportError:
+        return
+    r = runfiles.Create()
+    if r is None:
+        return
+    # RUNFILES_* are set under `bazel run` too, where TEST_TMPDIR is absent — guard
+    # it like everything else in this function rather than KeyError.
+    test_tmp = os.environ.get("TEST_TMPDIR")
+    if not test_tmp:
+        return
+    model_root = Path(test_tmp) / "shrike-models"
+    found = False
+    for src, dests in _BAZEL_MODELS.items():
+        loc = r.Rlocation(src)
+        if not loc or not os.path.exists(loc):
+            continue
+        for dest in dests:
+            target = model_root / dest
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                shutil.copy(loc, target)
+        found = True
+    if found:
+        os.environ["SHRIKE_TEST_MODEL_DIR"] = str(model_root)
+
+
+_populate_bazel_model_dir()
 
 # -- Per-test mutation tracking (drives the cheap collection reset) -----------
 #
@@ -258,9 +378,15 @@ def _server_launch_cmd() -> list[str]:
         except ImportError:
             pass
         else:
-            server = runfiles.Create().Rlocation("_main/bin/server")
-            if server and os.path.exists(server):
-                return [server]
+            r = runfiles.Create()
+            if r is not None:
+                # Prefer the backend-equipped server (onnx/clip in-process) when a
+                # test data-deps it; else the lean default (handles llama, which is
+                # a subprocess).
+                for name in ("_main/bin/server_embedding", "_main/bin/server"):
+                    server = r.Rlocation(name)
+                    if server and os.path.exists(server):
+                        return [server]
     return [sys.executable, "-m", "shrike.server"]
 
 
