@@ -408,6 +408,98 @@ impl RemoteEmbedder {
     }
 }
 
+/// The llama-server lifecycle manager (#342 P4b) under the llama facade:
+/// spawn + health-wait + orphan reaping + escalating stop, all native. NOT
+/// an embedder — the facade composes manager → endpoint → RemoteEmbedder.
+#[pyclass]
+pub(crate) struct LlamaServerManager {
+    inner: std::sync::Mutex<shrike_llama_server::LlamaServerManager>,
+    /// Non-blocking observer state (the review's loop-stall finding): the
+    /// lifecycle Mutex is held for up to the 30s health-wait, and the
+    /// harness reads `running` on the LOOP thread — observers must never
+    /// contend with it. The cell is shared with the manager (set at spawn,
+    /// cleared on stop/observed exit); passthrough is pure config,
+    /// precomputed at construction.
+    pid_cell: std::sync::Arc<std::sync::Mutex<Option<u32>>>,
+    passthrough: Vec<String>,
+}
+
+#[pymethods]
+impl LlamaServerManager {
+    #[new]
+    #[pyo3(signature = (model, *, host, port, binary=None, log_dir=None, context_size=None, threads=None, gpu_layers=None, pooling=None, extra_args=vec![], pid_file=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        model: String,
+        host: String,
+        port: u16,
+        binary: Option<String>,
+        log_dir: Option<String>,
+        context_size: Option<u32>,
+        threads: Option<u32>,
+        gpu_layers: Option<i32>,
+        pooling: Option<String>,
+        extra_args: Vec<String>,
+        pid_file: Option<String>,
+    ) -> Self {
+        let cfg = shrike_llama_server::LlamaServerConfig {
+            binary,
+            model,
+            host,
+            port,
+            log_dir: log_dir.map(std::path::PathBuf::from),
+            context_size,
+            threads,
+            gpu_layers,
+            pooling,
+            extra_args,
+            pid_file: pid_file.map(std::path::PathBuf::from),
+        };
+        let manager = shrike_llama_server::LlamaServerManager::new(cfg);
+        Self {
+            pid_cell: manager.pid_cell(),
+            passthrough: manager.passthrough_tokens(false),
+            inner: std::sync::Mutex::new(manager),
+        }
+    }
+
+    /// Spawn + health-wait (blocking — the facade runs it off the loop).
+    fn start(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.inner.lock().expect("manager poisoned").start())
+            .map_err(to_py_err)
+    }
+
+    /// SIGTERM → SIGKILL stop (blocking, up to the shutdown tiers).
+    fn stop(&self, py: Python<'_>) {
+        py.detach(|| self.inner.lock().expect("manager poisoned").stop())
+    }
+
+    /// Non-blocking: a real child poll when the lifecycle lock is free; the
+    /// observed-PID cell when a start/stop holds it (mid-start a spawned
+    /// child reads as running — the Python facade's `poll()` semantics).
+    fn running(&self) -> bool {
+        match self.inner.try_lock() {
+            Ok(mut manager) => manager.running(),
+            Err(_) => self.pid_cell.lock().expect("pid cell poisoned").is_some(),
+        }
+    }
+
+    /// Non-blocking, same split as [`Self::running`].
+    fn pid(&self) -> Option<u32> {
+        match self.inner.try_lock() {
+            Ok(manager) => manager.pid(),
+            Err(_) => *self.pid_cell.lock().expect("pid cell poisoned"),
+        }
+    }
+
+    /// The effective passthrough (reserved flags stripped, silent) — pure
+    /// config, precomputed; the facade folds it into the fingerprint's
+    /// `args=` suffix.
+    fn passthrough_tokens(&self) -> Vec<String> {
+        self.passthrough.clone()
+    }
+}
+
 // ── Derived-text engine (#281) ──────────────────────────────────────────────
 
 /// Whether the linked SQLite has FTS5 with the trigram tokenizer (#300).
@@ -735,6 +827,7 @@ fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<OnnxTextEmbedder>()?;
     m.add_class::<ClipEmbedder>()?;
     m.add_class::<RemoteEmbedder>()?;
+    m.add_class::<LlamaServerManager>()?;
     m.add_class::<NativeIndexEngine>()?;
     m.add_class::<DerivedTextEngine>()?;
     m.add_class::<py_recognizer::PyRecognizer>()?;

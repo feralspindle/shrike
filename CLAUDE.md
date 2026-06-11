@@ -414,7 +414,7 @@ The embedding service can be cycled independently of the Shrike server. `Embeddi
 - **Pooling type:** `--embedding-pooling {mean|last|cls|none}` (config `embedding.pooling`, `SHRIKE_EMBEDDING_POOLING`) is passed to llama-server as `--pooling`. Unset means "use the model's GGUF default" — fine for BERT-family models (`all-MiniLM-L6-v2`, `bge-m3`) that carry mean pooling in metadata. **Last-token models (Jina v5, Qwen3-Embedding) need `--embedding-pooling last`**: their pooling type isn't in the GGUF metadata, so without it llama-server defaults to mean and produces wrong embeddings (and some of these architectures may need a newer llama.cpp than the pinned `LLAMA_TAG` — see `scripts/llama-server.lock`). Pooling is folded into `model_id` (below) so changing it forces an index rebuild.
 - **Generic arg passthrough:** `--embedding-arg` (repeatable; config `embedding.extra_args` as a list; `SHRIKE_EMBEDDING_ARGS` as one shlex string) appends raw tokens to the llama-server command for the long tail of **runtime-only** flags (`--flash-attn`, `--ubatch-size`, gpu split, …). Each entry is `shlex`-split at command-build time and appended last. Two guardrails: (1) Shrike-owned flags (`--model`/`-m`/`--host`/`--port`/`--embeddings`/`--embedding`, plus their value token) are stripped with a warning — `--host` especially, since llama-server is pinned to loopback (audit §1.1); (2) the effective passthrough is folded into `model_id`, so **any** change forces a rebuild (conservative — Shrike can't tell a vector-affecting flag from a perf-only one in an opaque bag). **Vector-affecting flags must be typed settings** (like `--embedding-pooling`), not buried here. Normalization is *not* such a setting: USearch's `cos` metric is scale-invariant (verified in `index.py`), so `--embd-normalize` is moot.
 - Starting llama-server blocks (model load + health wait), so the HTTP handler runs it via `asyncio.to_thread` to keep the event loop responsive.
-- **Orphan reaping:** `EmbeddingService` records the llama-server PID in `<state-dir>/embedding.pid` (written after spawn, removed on clean stop). If Shrike is hard-killed (SIGKILL, incl. the daemon's own force-kill path), llama-server is orphaned and keeps holding its port. On the next `start()`, `_reap_orphan` detects a recorded PID that is still alive *and* holding the port and terminates it (SIGTERM→SIGKILL) before binding. `PR_SET_PDEATHSIG` is intentionally avoided: the parent-death signal keys on the spawning *thread*, and start runs under `asyncio.to_thread`, so a reclaimed pool thread could kill a live server.
+- **Orphan reaping:** the native lifecycle manager (`shrike-llama-server`, #342 P4b) records the llama-server PID in `<state-dir>/embedding.pid` (written after spawn, removed on clean stop). If Shrike is hard-killed (SIGKILL, incl. the daemon's own force-kill path), llama-server is orphaned and keeps holding its port. On the next `start()`, the manager's reap detects a recorded PID that is still alive *and* holding the port and terminates it (SIGTERM→SIGKILL) before binding — both signals required, so a recycled PID can't kill an unrelated process. `PR_SET_PDEATHSIG` is intentionally avoided: the parent-death signal keys on the spawning *thread*, and start runs under `asyncio.to_thread`, so a reclaimed pool thread could kill a live server.
 
 ### Recognition (OCR) — #228
 
@@ -571,7 +571,12 @@ pipelined rather than serial:
 - **Then label, auto-merge, move on.** Apply `ci` once review findings are
   addressed, and immediately set the PR to merge when green
   (`gh pr merge --auto --squash`) — don't poll for green; while CI runs,
-  proactively move on to the next step.
+  proactively move on to the next step. Label as a **separate step after the
+  push settles**: pushing and labeling in one breath races the `synchronize`
+  run (whose payload lacks the label) against the `labeled` run; the
+  concurrency group can cancel the labeled one and the survivor fails
+  `ci-ok` fail-closed (every job "skipping"). If that shape appears, toggle
+  the label off and on to re-trigger.
 - **Subagents assist with research, orientation, and review — never
   authorship.** All code and tests are developed by the agent itself; use
   subagents wherever they speed up or improve the work (codebase orientation,
