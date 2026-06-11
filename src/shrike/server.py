@@ -49,7 +49,6 @@ from shrike.kernel import (
 )
 from shrike.log import configure_logging
 from shrike.paths import cache_dir, state_dir
-from shrike.search_fusion import make_search_pipeline
 from shrike.tools import register_tools
 
 logger = logging.getLogger("shrike.server")
@@ -258,6 +257,7 @@ def _register_custom_routes(
     """
     wrapper = kernel.wrapper
     saver = kernel.saver
+    from starlette.background import BackgroundTask
     from starlette.requests import Request
     from starlette.responses import FileResponse, JSONResponse, Response
 
@@ -429,11 +429,17 @@ def _register_custom_routes(
         logger.info("Shutdown complete")
 
         async def _exit_after_response() -> None:
+            # Runs as the response's BackgroundTask — i.e. only AFTER the body
+            # has been sent (a sleep-timer grace raced the process exit under a
+            # saturated CI runner: the client saw a connection reset, not the
+            # 200). The brief sleep lets the OS-level write drain before exit.
             await asyncio.sleep(0.1)
             os._exit(0)
 
-        asyncio.create_task(_exit_after_response())
-        return JSONResponse({"status": "ok", "pid": os.getpid()})
+        return JSONResponse(
+            {"status": "ok", "pid": os.getpid()},
+            background=BackgroundTask(_exit_after_response),
+        )
 
 
 def main() -> None:
@@ -890,7 +896,6 @@ def main() -> None:
         index=index,
         saver=saver,
         derived=derived,
-        pipeline=make_search_pipeline(),
         allow_private_fetch=allow_private_media_fetch,
         server_path_roots=server_path_roots,
         media_base_url=media_base_url,
