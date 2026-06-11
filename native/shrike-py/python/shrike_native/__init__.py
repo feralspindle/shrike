@@ -27,7 +27,10 @@ from shrike_native._native import (
     fused_search_text,
     init_logging,
     init_onnx_runtime,
+    LoopTimerHost,
+    WorkerExecutor,
     parallel_sum,
+    timer_probe,
     rrf_fuse,
     schema_catalog,
     schema_roundtrip,
@@ -44,6 +47,8 @@ with contextlib.suppress(ImportError):
     from shrike_native._native import action_collection_query  # noqa: F401
     from shrike_native._native import action_list_notes  # noqa: F401
     from shrike_native._native import action_search_notes  # noqa: F401
+    from shrike_native._native import AsyncCollection  # noqa: F401
+    from shrike_native._native import async_collection_open  # noqa: F401
     from shrike_native._native import decode_media_b64  # noqa: F401
     from shrike_native._native import fetch_media_url  # noqa: F401
     from shrike_native._native import rehomed_actions  # noqa: F401
@@ -66,7 +71,10 @@ __all__ = [
     "fused_search_text",
     "init_logging",
     "init_onnx_runtime",
+    "LoopTimerHost",
+    "WorkerExecutor",
     "rrf_fuse",
+    "timer_probe",
     "parallel_sum",
     "schema_catalog",
     "schema_roundtrip",

@@ -83,6 +83,27 @@ pub trait SerialExecutor: Send + Sync {
     fn submit(&self, job: Box<dyn FnOnce() + Send + 'static>) -> BoxFuture<'static, ()>;
 }
 
+/// The debounce/idle-timer contract the harness injects (#332 S3c-1) — the
+/// sibling of [`SerialExecutor`], for the kernel's two timer consumers (the
+/// index saver's debounced flush; the cooperative idle release). One-shot:
+/// `schedule` arms a job after `delay_secs`; the returned handle cancels it
+/// (a no-op once fired). No threads owned here either — the asyncio harness
+/// backs this with `loop.call_later`, an embedded host with its own timers.
+pub trait TimerHost: Send + Sync {
+    fn schedule(
+        &self,
+        delay_secs: f64,
+        job: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Box<dyn TimerCancel>;
+}
+
+/// Cancels a scheduled (not-yet-fired) timer job. Dropping without calling
+/// `cancel` leaves the timer armed (cancellation is explicit, like the
+/// asyncio handle it mirrors).
+pub trait TimerCancel: Send {
+    fn cancel(&self);
+}
+
 /// The simplest conforming executor: mutual exclusion on the calling thread.
 /// Serialized (the mutex), thread-agnostic (runs wherever the caller is), no
 /// threads owned. A real harness may instead pin a worker thread (the Python
@@ -107,13 +128,17 @@ impl SerialExecutor for MutexExecutor {
 /// The collection behind the injected executor: every access is one submitted
 /// job; the core never escapes. (CollectionCore is Send: anki's Backend is
 /// internally synchronized, which is what makes thread migration safe.)
-struct SerializedCollection {
+///
+/// Public since #332 (S3): this is the embedded-host surface the asyncio
+/// bridge binds — open/run/close as runtime-agnostic futures over whatever
+/// executor the harness injected.
+pub struct SerializedCollection {
     core: Arc<CollectionCore>,
     executor: Arc<dyn SerialExecutor>,
 }
 
 impl SerializedCollection {
-    async fn open(
+    pub async fn open(
         collection_path: String,
         executor: Arc<dyn SerialExecutor>,
     ) -> NativeResult<Self> {
@@ -135,7 +160,7 @@ impl SerializedCollection {
 
     /// Run a job against the collection, serialized; the await IS the
     /// transition point ops chain continuations onto.
-    async fn run<T: Send + 'static>(
+    pub async fn run<T: Send + 'static>(
         &self,
         job: impl FnOnce(&CollectionCore) -> T + Send + 'static,
     ) -> NativeResult<T> {
@@ -150,7 +175,7 @@ impl SerializedCollection {
             .map_err(|_| NativeError::internal("executor dropped a collection job"))
     }
 
-    async fn close(&self) -> NativeResult<()> {
+    pub async fn close(&self) -> NativeResult<()> {
         self.run(|core| core.close()).await?
     }
 }
