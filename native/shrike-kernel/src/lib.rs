@@ -453,7 +453,13 @@ impl Kernel {
     /// job for embed inputs + derived rows, one orchestrator add (replace
     /// semantics — when an embedder is attached; notes are created and
     /// lexically indexed regardless), per-note derived ingest, and the
-    /// watermark advance. The shared tail of every upsert shape.
+    /// watermark advance. The shared tail of every upsert shape — public as
+    /// `reindex_notes` for harness ops that edit note text outside the
+    /// upsert ops (find/replace, note-type migration).
+    pub async fn reindex_notes(&self, written: &[i64]) -> NativeResult<()> {
+        self.index_written(written).await
+    }
+
     async fn index_written(&self, written: &[i64]) -> NativeResult<()> {
         if written.is_empty() {
             return Ok(());
@@ -622,6 +628,24 @@ impl Kernel {
         }
         .instrument(span)
         .await
+    }
+
+    /// Drop already-deleted notes from the index + derived store (the prune
+    /// path: the collection op removed them internally; this is the sidecar
+    /// half of `delete_notes`).
+    pub async fn forget_notes(&self, note_ids: Vec<i64>) -> NativeResult<()> {
+        self.orchestrator.remove(&note_ids)?;
+        self.derived.remove(&note_ids, None)?;
+        self.advance_watermarks(self.embed_service().is_some())
+            .await
+    }
+
+    /// A metadata-only collection change (tags/decks/templates/field metadata
+    /// — nothing that feeds embedding text or derived rows): advance the
+    /// watermarks so the col_mod bump doesn't read as drift on next boot.
+    pub async fn metadata_changed(&self) -> NativeResult<()> {
+        self.advance_watermarks(self.embed_service().is_some())
+            .await
     }
 
     pub async fn delete_notes(&self, note_ids: Vec<i64>) -> NativeResult<usize> {
