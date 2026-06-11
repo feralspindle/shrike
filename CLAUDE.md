@@ -139,6 +139,24 @@ pytest tests/unit -v                           # Unit tests (fast, no server)
 pytest tests/integration -v -m integration     # Integration tests (starts a server)
 ```
 
+#### Native (Rust) workspace
+
+The Rust workspace lives in `native/` (run `cargo` from there); the Python
+extension is rebuilt into the venv with `scripts/build-native.sh` (the fast
+pip-lane inner loop — run it after any Rust change before pytest, which
+otherwise tests the stale extension). **Bazel is NOT on PATH** — use the
+committed `./bazel` launcher at the repo root (it bootstraps bazelisk + the
+pinned Bazel from `.bazelversion`; same entry point CI uses). The full local
+gate for a native change:
+
+```bash
+(cd native && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings)
+(cd native && cargo clippy -p shrike-compute --no-default-features --all-targets -- -D warnings)
+(cd native && cargo test --workspace)
+scripts/build-native.sh && pytest tests/unit tests/native -q
+./bazel test //...      # the authoritative CI lane: all crate tests + layering check + py suites
+```
+
 #### Coverage
 
 Coverage lives in its own workflow (`.github/workflows/coverage.yml`), **off the
@@ -537,6 +555,30 @@ These are required, not optional, and run in addition to the CI lint/test gates:
 Reviews/audits are launched by the user (the `ultra`/cloud passes are billed and
 user-triggered — the agent can't start them); the agent's job is to surface that
 a change crosses one of these thresholds and to act on the findings.
+
+### The agent's PR loop — delegated, self-driving
+
+For work the user has delegated, the agent owns the whole PR cycle and keeps it
+pipelined rather than serial:
+
+- **PR at each natural checkpoint.** Don't contort in-progress work to make it
+  mergeable when going a bit further lands a larger, coherent section — but
+  don't hoard mergeable work either.
+- **Self-review before the `ci` label, not after.** Run a self-check code
+  review against the requirements on the ready PR — via a **subagent
+  (prefer the latest Opus model)** — *before* labeling, so review findings
+  never burn a CI re-run. Keep working while the review is in flight.
+- **Then label, then merge.** Apply `ci` once review findings are addressed;
+  while CI runs, proactively move on to the next step; merge on green.
+- **Subagents assist with research, orientation, and review — never
+  authorship.** All code and tests are developed by the agent itself; use
+  subagents wherever they speed up or improve the work (codebase orientation,
+  API research, parallel fact-finding, the self-check review above).
+
+This composes with the gates above: the user-triggered billed passes
+(`ultra`/cloud review, security/perf audits) stay user-triggered; the agent's
+self-review is the floor, not a replacement, for anything crossing those
+thresholds.
 
 ### Defect workflow — follow this when you find a defect or limitation
 
