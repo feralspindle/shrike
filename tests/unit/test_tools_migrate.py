@@ -8,6 +8,7 @@ validation failures must not touch the index.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -47,10 +48,15 @@ def mcp_app(wrapper, mock_index, mock_saver):
 
 def _add_basic(wrapper, front, back="x"):
     def build(c):
-        n = c.new_note(c.models.by_name("Basic"))
-        n["Front"], n["Back"] = front, back
-        c.add_note(n, c.decks.id("D"))
-        return n.id
+        return json.loads(
+            c.upsert_notes(
+                json.dumps(
+                    [{"note_type": "Basic", "deck": "D", "fields": {"Front": front, "Back": back}}]
+                ),
+                "allow",
+                False,
+            )
+        )[0]["id"]
 
     return wrapper.run_sync(build)
 
@@ -71,7 +77,7 @@ class TestMigrateNoteTypeTool:
         assert result["changed"] == [nid]
         mock_index.add.assert_called_once()
         assert [i.note_id for i in mock_index.add.call_args.args[0]] == [nid]
-        assert mock_index.col_mod == wrapper.col.mod
+        assert mock_index.col_mod == wrapper.run_sync(lambda c: c.col_mod())
         mock_saver.request_save.assert_called_once()
 
     def test_dry_run_does_not_touch_index(self, wrapper, mock_index, mock_saver, mcp_app):

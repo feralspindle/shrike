@@ -12,6 +12,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from shrike.index import IndexSaver, IndexState, VectorIndex
 from shrike.tools import register_tools
+from tests.unit.conftest import make_notes
 
 
 def _call(mcp: FastMCP, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -21,7 +22,7 @@ def _call(mcp: FastMCP, name: str, args: dict[str, Any] | None = None) -> dict[s
 
 def _seed(wrapper, deck: str, front: str) -> int:
     note = {"deck": deck, "note_type": "Basic", "fields": {"Front": front, "Back": "x"}}
-    return wrapper.run_sync(lambda _c: wrapper._upsert_notes([note]))[0]["id"]
+    return make_notes(wrapper, [note])[0]["id"]
 
 
 @pytest.fixture()
@@ -64,7 +65,7 @@ class TestReembed:
         assert result["notes_changed"] == 1
         mock_index.add.assert_called_once()
         assert [i.note_id for i in mock_index.add.call_args[0][0]] == [nid]  # only the changed note
-        assert mock_index.col_mod == wrapper.col.mod
+        assert mock_index.col_mod == wrapper.run_sync(lambda c: c.col_mod())
         mock_saver.request_save.assert_called_once()
 
     def test_dry_run_does_not_touch_index(self, wrapper, mock_index, mock_saver, mcp_app):

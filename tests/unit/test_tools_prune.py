@@ -8,6 +8,7 @@ delete_notes); clearing unused tags is a col_mod-only metadata change. Dry-run
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -51,30 +52,44 @@ def _blank_note(wrapper):
 
 
 def _add(c):
-    n = c.new_note(c.models.by_name("Basic"))
-    n["Front"], n["Back"] = "tmp", "x"
-    c.add_note(n, c.decks.id("D"))
-    return n.id
+    return json.loads(
+        c.upsert_notes(
+            json.dumps(
+                [{"note_type": "Basic", "deck": "D", "fields": {"Front": "tmp", "Back": "x"}}]
+            ),
+            "allow",
+            False,
+        )
+    )[0]["id"]
 
 
 def _clear(c, nid):
-    n = c.get_note(nid)
-    for f in list(n.keys()):
-        n[f] = ""
-    c.update_note(n)
+    _, _, fields, _ = c.get_note(nid)
+    c.update_note(nid, ["" for _ in fields])
 
 
 def _orphan_tag(wrapper):
     nid = wrapper.run_sync(lambda c: _add_tagged(c))
-    wrapper.run_sync(lambda c: c.tags.bulk_remove([nid], "orphan"))
+    wrapper.run_sync(lambda c: c.update_note_tags([nid], remove=["orphan"]))
 
 
 def _add_tagged(c):
-    n = c.new_note(c.models.by_name("Basic"))
-    n["Front"], n["Back"] = "Q", "A"
-    n.tags = ["orphan"]
-    c.add_note(n, c.decks.id("D"))
-    return n.id
+    return json.loads(
+        c.upsert_notes(
+            json.dumps(
+                [
+                    {
+                        "note_type": "Basic",
+                        "deck": "D",
+                        "fields": {"Front": "Q", "Back": "A"},
+                        "tags": ["orphan"],
+                    }
+                ]
+            ),
+            "allow",
+            False,
+        )
+    )[0]["id"]
 
 
 class TestCollectionPruneTool:
@@ -95,7 +110,7 @@ class TestCollectionPruneTool:
         result = _call(mcp_app, "collection_prune", {"empty_notes": True, "dry_run": False})
         assert result["empty_notes"]["removed"] == [blank]
         mock_index.remove.assert_called_once_with([blank])
-        assert mock_index.col_mod == wrapper.col.mod
+        assert mock_index.col_mod == wrapper.run_sync(lambda c: c.col_mod())
         mock_saver.request_save.assert_called_once()
 
     def test_apply_unused_tags_bumps_without_index_remove(
@@ -105,7 +120,7 @@ class TestCollectionPruneTool:
         result = _call(mcp_app, "collection_prune", {"unused_tags": True, "dry_run": False})
         assert result["unused_tags"]["removed"] >= 1
         mock_index.remove.assert_not_called()  # no notes deleted
-        assert mock_index.col_mod == wrapper.col.mod  # but col_mod advanced
+        assert mock_index.col_mod == wrapper.run_sync(lambda c: c.col_mod())  # but col_mod advanced
         mock_saver.request_save.assert_called_once()
 
     def test_dry_run_default_does_not_mutate(self, wrapper, mock_index, mock_saver, mcp_app):
