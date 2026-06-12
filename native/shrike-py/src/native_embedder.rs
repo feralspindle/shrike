@@ -18,7 +18,11 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 
-use shrike_engine_api::{Blocking, Embedder, ImageEmbedder, WithPolicy};
+use shrike_engine_api::{Embedder, ImageEmbedder};
+// Used only inside the feature-gated engine constructors — a no-engine build
+// (anki-core alone) would otherwise warn on unused imports.
+#[cfg(any(feature = "engine-ort", feature = "engine-remote"))]
+use shrike_engine_api::{Blocking, WithPolicy};
 
 /// The assembled native embedder the kernel slot takes: the text half always,
 /// the image half when the engine embeds images (CLIP). Both halves are views
@@ -36,6 +40,7 @@ impl NativeEmbedder {
     /// engine can't know), `dim` what the facade probed, `safe_batch` the
     /// batch-safety probe's verdict capped by the operator's batch-size
     /// setting.
+    #[cfg(feature = "engine-ort")]
     #[staticmethod]
     #[pyo3(signature = (engine, *, fingerprint, dim, safe_batch))]
     fn from_onnx(
@@ -59,6 +64,7 @@ impl NativeEmbedder {
     /// Compose the remote-embeddings engine — llama-server today, any
     /// OpenAI-compatible endpoint tomorrow. Network requests run on the
     /// blocking pool, never a runtime worker.
+    #[cfg(feature = "engine-remote")]
     #[staticmethod]
     #[pyo3(signature = (engine, *, fingerprint, dim, safe_batch))]
     fn from_remote(
@@ -81,6 +87,7 @@ impl NativeEmbedder {
 
     /// Compose the CLIP dual encoder: one engine, both modalities — the same
     /// adapted instance serves the text and image halves.
+    #[cfg(feature = "engine-ort")]
     #[staticmethod]
     #[pyo3(signature = (engine, *, fingerprint, dim, safe_batch))]
     fn from_clip(
