@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -160,6 +161,12 @@ def save_config(config: dict[str, Any], path: Path | None = None) -> Path:
     idx_out = {k: idx[k] for k in ("save_delay", "save_threshold") if idx.get(k) is not None}
     if idx_out:
         output["index"] = idx_out
+
+    # The v2 capability sections (#498) pass through verbatim — structured,
+    # user-managed config; --save-config must never drop or rewrite them.
+    for key in ("embedders", "recognizers", "managed"):
+        if config.get(key) is not None:
+            output[key] = config[key]
 
     with open(filepath, "w") as f:
         f.write("# Shrike configuration\n")
@@ -471,6 +478,87 @@ def embedding_args(resolved: dict[str, Any], *, no_embedding: bool = False) -> l
     return args
 
 
+def resolve_embedding_profile(
+    config: dict[str, Any],
+    embedding_overrides: dict[str, Any] | None,
+    *,
+    quiet: bool = False,
+) -> dict[str, Any]:
+    """Resolve the embedding params, v2-first (#498 slice 1).
+
+    A config declaring the v2 sections (``embedders:``/``recognizers:``/
+    ``managed:``) is parsed, resolved against the build's compiled features,
+    and bridged onto the legacy param shape today's runtime consumes —
+    migration warnings print to stderr. The ``--embedding-*`` flags (and
+    their env twins) are incompatible with a v2 config: the config file is
+    the only home for the structured sections (docs/distribution.md); the
+    flags survive one release for legacy configs and then go entirely.
+    Without v2 sections, the legacy cascade runs unchanged (a deprecated
+    legacy ``embedding:``/``recognition:`` section warns via the migration).
+
+    ``quiet`` suppresses the deprecation/ignored-env warnings — set by the
+    passive resolution every client command performs for auto-start
+    (``build_server_spec``), so only the explicit ``server start`` /
+    ``embedding start`` paths warn, and exactly once.
+    """
+    from shrike.profiles import (
+        ProfileError,
+        parse_capabilities,
+        plan_to_legacy_embedding,
+        resolve_profile,
+    )
+
+    caps = parse_capabilities(config)
+    if caps.legacy:
+        if not quiet:
+            for warning in caps.warnings:
+                print(f"warning: {warning}", file=sys.stderr)
+        return resolve_embedding(config, **(embedding_overrides or {}))
+
+    overrides = {k: v for k, v in (embedding_overrides or {}).items() if v not in (None, [], ())}
+    if overrides:
+        raise ProfileError(
+            f"--embedding-*/--llama-server flags ({', '.join(sorted(overrides))}) are "
+            "incompatible with a config declaring embedders:/managed: — the config file "
+            "is the only home for these (docs/distribution.md)"
+        )
+    # The legacy env twins don't apply under v2 either — warn rather than let
+    # an ambient variable silently do nothing (the cross-talk #498 kills).
+    legacy_env = [
+        name
+        for name in (
+            "SHRIKE_EMBEDDING_BACKEND",
+            "SHRIKE_EMBEDDING_MODEL",
+            "SHRIKE_EMBEDDING_PORT",
+            "SHRIKE_EMBEDDING_POOLING",
+            "SHRIKE_EMBEDDING_ARGS",
+            "SHRIKE_EMBEDDING_ONNX_PROVIDERS",
+            "SHRIKE_EMBEDDING_BATCH_SIZE",
+            "LLAMA_SERVER_PATH",
+        )
+        if os.environ.get(name)
+    ]
+    if legacy_env and not quiet:
+        print(
+            f"warning: {', '.join(legacy_env)} ignored — the config declares "
+            "embedders:/managed:, which is the only home for embedding settings "
+            "(docs/distribution.md)",
+            file=sys.stderr,
+        )
+
+    import shrike_native  # lazy: keeps plain client commands import-light
+
+    plan = resolve_profile(caps, shrike_native.build_features())
+    if not quiet:
+        for warning in plan.warnings:
+            print(f"warning: {warning}", file=sys.stderr)
+    resolved = plan_to_legacy_embedding(plan)
+    for key in ("model", "llama_server"):
+        if resolved.get(key):
+            resolved[key] = os.path.expanduser(str(resolved[key]))
+    return resolved
+
+
 def build_server_spec(
     config: dict[str, Any],
     *,
@@ -502,7 +590,9 @@ def build_server_spec(
     resolved_log_dir = str(
         Path(log_dir or log_config.get("dir") or str(_default_log_dir())).expanduser()
     )
-    resolved_emb = resolve_embedding(config, **(embedding_overrides or {}))
+    # quiet: this resolution runs passively on every client command (the
+    # auto-start spec); the explicit start commands own the warnings.
+    resolved_emb = resolve_embedding_profile(config, embedding_overrides, quiet=True)
     resolved_index = resolve_index_save(config, **(index_save_overrides or {}))
     resolved_transport = resolve_transport(config, **(transport_overrides or {}))
     resolved_locking = resolve_locking(config, **(locking_overrides or {}))
