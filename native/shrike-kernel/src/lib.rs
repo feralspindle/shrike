@@ -270,6 +270,15 @@ pub struct Kernel {
     /// when its slot is empty.
     recognize: RwLock<BTreeMap<recognize::RecognitionPurpose, Arc<RecognizeService>>>,
     recognition_gate: recognize::RecognitionGate,
+    /// Bounds concurrent LONG-RUNNING recognition dispatches (#485): a VLM
+    /// describe / ASR call parks a blocking-pool thread for its whole duration
+    /// while holding model residency, so an unbounded fan-out (several
+    /// purposes, several collections sharing one runtime, or a future
+    /// batch-parallel sweep) could starve the pool. Each long-running
+    /// `recognize()` acquires a permit; OCR never touches it. A `Semaphore`
+    /// (not a batch-size cap) because it bounds CONCURRENCY without shrinking a
+    /// single sweep's batch — throughput per call is unchanged.
+    slow_recognition: Arc<tokio::sync::Semaphore>,
 }
 
 /// One attached recognition capability: the engine + the media resolver it
@@ -279,6 +288,16 @@ pub struct RecognizeService {
     pub recognizer: Arc<dyn Recognizer>,
     pub resolver: Arc<dyn ImageResolver>,
 }
+
+/// How many long-running recognition dispatches (VLM describe / ASR) may run
+/// concurrently across the kernel (#485). A small bound: these calls park a
+/// blocking-pool thread for their whole duration while holding model
+/// residency, so the ceiling protects the pool from an unbounded fan-out
+/// (multiple purposes, several collections sharing the runtime, a future
+/// batch-parallel sweep). 2 keeps a describe and an ASR sweep able to overlap
+/// (different engines) without letting either multiply without bound; OCR is
+/// fast/bounded and never acquires a permit.
+pub const SLOW_RECOGNITION_CONCURRENCY: usize = 2;
 
 /// The derived-store source recognized image text lands under (#199/#228).
 pub const OCR_SOURCE: &str = "ocr";
@@ -473,6 +492,7 @@ impl Kernel {
             tag_refresh,
             recognize: RwLock::new(BTreeMap::new()),
             recognition_gate: recognize::RecognitionGate::default(),
+            slow_recognition: Arc::new(tokio::sync::Semaphore::new(SLOW_RECOGNITION_CONCURRENCY)),
         })
     }
 
@@ -1043,9 +1063,26 @@ impl Kernel {
         }
         // The chunk-Err propagates HERE — before any persist or fingerprint
         // advance below — so a down endpoint leaves the backlog intact.
+        // A long-running purpose (describe/ASR) holds a concurrency permit
+        // ONLY across the recognize() call (#485): the call parks a
+        // blocking-pool thread for its whole duration while holding model
+        // residency, so the kernel bounds how many run at once. The permit is
+        // released the instant recognition returns (before the cheap persist),
+        // so it never delays anything but the next SLOW dispatch. OCR is fast
+        // and never acquires — its dispatch is byte-identical.
         let recognitions = if items.is_empty() {
             Vec::new()
         } else {
+            let _permit = if purpose.is_long_running() {
+                Some(
+                    self.slow_recognition
+                        .acquire()
+                        .await
+                        .expect("slow-recognition semaphore never closes"),
+                )
+            } else {
+                None
+            };
             svc.recognizer.recognize(items).await?
         };
         if recognitions.len() != sent.len() {
@@ -1084,6 +1121,20 @@ impl Kernel {
         for ((note_id, name), recognition) in sent.iter().zip(recognitions.iter()) {
             match self.recognition_gate.judge(recognition) {
                 recognize::GateOutcome::Drop => {
+                    // The below-gate marker is ALSO the negative cache for a
+                    // per-item PERMANENT failure (#485): an engine converts a
+                    // 4xx-class rejection (this image is oversized/unsupported)
+                    // into the empty recognition (`text="", confidence=0.0`),
+                    // which gates as Drop here — so a permanently-failed item is
+                    // judged once and not re-offered every sweep (expensive
+                    // against a paid endpoint), and clears on a fingerprint
+                    // change exactly like a stored row re-derives. This is
+                    // deliberately the SAME path as a genuine below-substance
+                    // drop (no sibling `failed` table): behaviour is identical
+                    // and no consumer needs the diagnostic split. NB an
+                    // ENDPOINT-level failure (transport/auth/exhausted retries)
+                    // never reaches here — it Err's the chunk above, before any
+                    // persist, leaving the whole backlog pending.
                     gated.push((*note_id, name.clone()));
                     continue;
                 }
@@ -1134,10 +1185,9 @@ impl Kernel {
     }
 
     /// `(note_id, media_names)` for every note referencing media of `kind` —
-    /// the sweep's pending-set source, routed by media kind (#485). Image
-    /// refs come from `note_image_refs` (the `<img src>` extractor); audio
-    /// enumeration (`note_audio_refs`, the `[sound:…]` extractor) lands in
-    /// Slice 2 (#485) — until then an Audio purpose has an empty pending set.
+    /// the sweep's pending-set source, routed by media kind (#485). Image refs
+    /// come from `note_image_refs` (the `<img src>` extractor); audio refs from
+    /// `note_sound_refs` (the `[sound:…]` extractor) — both scoped reads (#445).
     async fn note_media_refs(
         &self,
         kind: recognize::MediaKind,
@@ -1146,8 +1196,9 @@ impl Kernel {
             recognize::MediaKind::Image => {
                 self.collection.run(|core| core.note_image_refs()).await?
             }
-            // Slice 2 wires `core.note_audio_refs()` here.
-            recognize::MediaKind::Audio => Ok(Vec::new()),
+            recognize::MediaKind::Audio => {
+                self.collection.run(|core| core.note_sound_refs()).await?
+            }
         }
     }
 
@@ -3406,6 +3457,520 @@ mod no_cpython_smoke {
             // OCR text still searchable after the describe re-derive.
             let still = kernel.search("opaque image bytes", 5).await.unwrap();
             assert!(still.iter().any(|h| h.note_id == photo_id));
+
+            kernel.close().await.unwrap();
+            std::fs::remove_dir_all(dir).ok();
+        });
+    }
+
+    /// An ASR recognizer over audio bytes: transcribes the bytes and carries a
+    /// single time-`Span` segment (the audio locator, vs OCR's bbox).
+    struct AsrRecognizer;
+
+    impl Recognizer for AsrRecognizer {
+        fn recognize(
+            &self,
+            items: Vec<MediaItem>,
+        ) -> BoxFuture<'_, NativeResult<Vec<Recognition>>> {
+            Box::pin(async move {
+                Ok(items
+                    .iter()
+                    .map(|m| {
+                        let text = String::from_utf8_lossy(&m.bytes).to_string();
+                        Recognition {
+                            text: text.clone(),
+                            confidence: 0.9,
+                            segments: vec![Segment {
+                                text,
+                                confidence: 0.9,
+                                // A time range, not a bbox — the audio locator.
+                                locator: Some(Locator::Span([0.0, 2.5])),
+                            }],
+                        }
+                    })
+                    .collect())
+            })
+        }
+
+        fn fingerprint(&self) -> Option<String> {
+            Some("asr:stub:v1".to_string())
+        }
+    }
+
+    #[test]
+    fn asr_sweep_enumerates_sound_refs_and_mints_lexical_and_vector() {
+        // #485 PR2: the AUDIO path end-to-end. A note referencing [sound:…]
+        // audio is enumerated by note_sound_refs (the new audio twin), the ASR
+        // purpose recognizes it (source "asr", LexicalAndVector like OCR), and
+        // both consumers light up: the transcript is lexically searchable AND
+        // mints a text-space vector. Span segments persist. OCR is untouched.
+        crate::runtime::block_on(async {
+            let dir = temp_dir();
+            let kernel = Kernel::open(
+                dir.join("c.anki2").to_str().unwrap(),
+                dir.join("cache").to_str().unwrap(),
+            )
+            .await
+            .unwrap();
+            kernel.attach_embedder(Arc::new(HashEmbedder), None);
+            kernel.reindex_if_needed().await.unwrap();
+
+            // One audio note, one image note — to prove the AUDIO purpose reads
+            // ONLY [sound:] refs (never the image), and vice versa.
+            let notes = vec![
+                serde_json::json!({"note_type": "Basic", "deck": "Default",
+                    "fields": {"Front": "Listen [sound:lecture.mp3]", "Back": "b"}}),
+                serde_json::json!({"note_type": "Basic", "deck": "Default",
+                    "fields": {"Front": "zzz filler card qqq", "Back": "b"}}),
+            ];
+            let results: Vec<serde_json::Value> = serde_json::from_str(
+                &upsert_wire(
+                    &kernel,
+                    serde_json::json!(notes).to_string(),
+                    "error".to_string(),
+                    false,
+                )
+                .await,
+            )
+            .unwrap();
+            let audio_id = results[0]["id"].as_i64().unwrap();
+
+            let mut media = std::collections::HashMap::new();
+            media.insert(
+                "lecture.mp3".to_string(),
+                b"mitochondria are the powerhouse of the cell".to_vec(),
+            );
+            let resolver = Arc::new(MapResolver::new(media));
+
+            kernel.attach_recognizer_with(
+                recognize::RecognitionPurpose::Asr,
+                Arc::new(AsrRecognizer),
+                resolver.clone(),
+            );
+            assert_eq!(
+                kernel.attached_recognition_purposes(),
+                vec![recognize::RecognitionPurpose::Asr]
+            );
+
+            // The sweep enumerates the [sound:] ref and transcribes it.
+            let report = kernel.recognize_pending(10).await.unwrap();
+            assert_eq!(
+                report,
+                recognize::SweepReport::Ran {
+                    recognized: 1,
+                    stored: 1,
+                    remaining: 0
+                }
+            );
+
+            // LexicalAndVector — both consumers: the transcript is lexically
+            // searchable (exact) ...
+            let lex = kernel.search("powerhouse of the cell", 5).await.unwrap();
+            let lex_hit = lex
+                .iter()
+                .find(|h| h.note_id == audio_id)
+                .expect("asr transcript lexically searchable");
+            assert!(lex_hit.signals.iter().any(|(s, _)| s == "exact"));
+
+            // ... AND mints a vector (a non-literal token-bag query surfaces it
+            // via the text space).
+            let sem = kernel
+                .search("cell powerhouse mitochondria", 5)
+                .await
+                .unwrap();
+            assert!(
+                sem.iter()
+                    .find(|h| h.note_id == audio_id)
+                    .is_some_and(|h| h.signals.iter().any(|(s, _)| s == "text")),
+                "asr transcript mints a text vector"
+            );
+
+            // A second sweep is idle — the item is DONE (not re-transcribed).
+            let idle = kernel.recognize_pending(10).await.unwrap();
+            assert_eq!(idle, recognize::SweepReport::Idle);
+
+            kernel.close().await.unwrap();
+            std::fs::remove_dir_all(dir).ok();
+        });
+    }
+
+    /// A recognizer that records the PEAK number of `recognize()` calls
+    /// in-flight at once — the probe for the slow-recognition concurrency
+    /// bound (#485). Each call holds for a beat (so concurrent calls actually
+    /// overlap) and transcribes the bytes.
+    struct ConcurrencyProbeRecognizer {
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Recognizer for ConcurrencyProbeRecognizer {
+        fn recognize(
+            &self,
+            items: Vec<MediaItem>,
+        ) -> BoxFuture<'_, NativeResult<Vec<Recognition>>> {
+            let in_flight = Arc::clone(&self.in_flight);
+            let peak = Arc::clone(&self.peak);
+            Box::pin(async move {
+                let now = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(items
+                    .iter()
+                    .map(|m| Recognition {
+                        text: String::from_utf8_lossy(&m.bytes).to_string(),
+                        confidence: 0.9,
+                        segments: Vec::new(),
+                    })
+                    .collect())
+            })
+        }
+
+        fn fingerprint(&self) -> Option<String> {
+            Some("probe:v1".to_string())
+        }
+    }
+
+    #[test]
+    fn slow_recognition_concurrency_is_bounded() {
+        // #485 PR2: a long-running purpose's recognize() holds a concurrency
+        // permit, so no more than SLOW_RECOGNITION_CONCURRENCY run at once even
+        // when several single-item sweeps are driven CONCURRENTLY. (One audio
+        // note per item; max_items=1 makes each concurrent sweep one
+        // recognize() dispatch.) The probe records the peak overlap.
+        crate::runtime::block_on(async {
+            let dir = temp_dir();
+            let kernel = Kernel::open(
+                dir.join("c.anki2").to_str().unwrap(),
+                dir.join("cache").to_str().unwrap(),
+            )
+            .await
+            .unwrap();
+            kernel.attach_embedder(Arc::new(HashEmbedder), None);
+            kernel.reindex_if_needed().await.unwrap();
+
+            // Several audio notes so concurrent single-item sweeps pick
+            // distinct items (the pending diff hands each a different ref).
+            let n = 6;
+            let mut media = std::collections::HashMap::new();
+            let notes: Vec<serde_json::Value> = (0..n)
+                .map(|i| {
+                    let name = format!("clip{i}.mp3");
+                    media.insert(
+                        name.clone(),
+                        format!("transcript number {i} here").into_bytes(),
+                    );
+                    serde_json::json!({"note_type": "Basic", "deck": "Default",
+                        "fields": {"Front": format!("Listen [sound:{name}]"), "Back": "b"}})
+                })
+                .collect();
+            upsert_wire(
+                &kernel,
+                serde_json::json!(notes).to_string(),
+                "error".to_string(),
+                false,
+            )
+            .await;
+
+            let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            kernel.attach_recognizer_with(
+                recognize::RecognitionPurpose::Asr,
+                Arc::new(ConcurrencyProbeRecognizer {
+                    in_flight: Arc::clone(&in_flight),
+                    peak: Arc::clone(&peak),
+                }),
+                Arc::new(MapResolver::new(media)),
+            );
+
+            // Drive `n` concurrent single-item ASR sweeps. Without the bound,
+            // peak would reach up to `n`; with it, peak ≤ the ceiling.
+            let kernel = Arc::new(kernel);
+            let mut handles = Vec::new();
+            for _ in 0..n {
+                let k = Arc::clone(&kernel);
+                handles.push(tokio::spawn(async move {
+                    k.recognize_pending_for(recognize::RecognitionPurpose::Asr, 1)
+                        .await
+                }));
+            }
+            for h in handles {
+                h.await.unwrap().unwrap();
+            }
+
+            let observed_peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                observed_peak >= 2,
+                "the probe should have observed real overlap (peak {observed_peak})"
+            );
+            assert!(
+                observed_peak <= SLOW_RECOGNITION_CONCURRENCY,
+                "slow-recognition concurrency must be bounded by \
+                 SLOW_RECOGNITION_CONCURRENCY={SLOW_RECOGNITION_CONCURRENCY}, saw peak \
+                 {observed_peak}"
+            );
+
+            Arc::try_unwrap(kernel)
+                .unwrap_or_else(|_| panic!("kernel still shared"))
+                .close()
+                .await
+                .unwrap();
+            std::fs::remove_dir_all(dir).ok();
+        });
+    }
+
+    /// A describe recognizer that returns the EMPTY recognition (`"", 0.0`) for
+    /// any item whose bytes contain a sentinel marker — the per-item PERMANENT-
+    /// failure shape (a 4xx the engine converts to the empty recognition) — and
+    /// real prose for any other. (MediaItem carries no name, so the stub keys
+    /// on the bytes, exactly as a real endpoint keys on the response for THAT
+    /// image.) Counts items seen so a test can prove the failed item is NOT
+    /// re-offered. Controllable fingerprint (the engine-upgrade retry).
+    struct PerItemFailingDescribe {
+        fail_marker: Vec<u8>,
+        prose: String,
+        fingerprint: std::sync::Mutex<String>,
+        items_seen: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Recognizer for PerItemFailingDescribe {
+        fn recognize(
+            &self,
+            items: Vec<MediaItem>,
+        ) -> BoxFuture<'_, NativeResult<Vec<Recognition>>> {
+            self.items_seen
+                .fetch_add(items.len(), std::sync::atomic::Ordering::SeqCst);
+            let fail = self.fail_marker.clone();
+            let prose = self.prose.clone();
+            Box::pin(async move {
+                Ok(items
+                    .iter()
+                    .map(|m| {
+                        // The condemned item yields the empty recognition
+                        // exactly like a 4xx in shrike-describe-remote.
+                        if m.bytes.windows(fail.len()).any(|w| w == fail.as_slice()) {
+                            Recognition {
+                                text: String::new(),
+                                confidence: 0.0,
+                                segments: Vec::new(),
+                            }
+                        } else {
+                            Recognition {
+                                text: prose.clone(),
+                                confidence: 1.0,
+                                segments: Vec::new(),
+                            }
+                        }
+                    })
+                    .collect())
+            })
+        }
+
+        fn fingerprint(&self) -> Option<String> {
+            Some(self.fingerprint.lock().unwrap().clone())
+        }
+    }
+
+    #[test]
+    fn per_item_permanent_failure_is_negative_cached_and_retried_on_fingerprint_change() {
+        // #485 PR2 item 4: a per-item PERMANENT failure (a 4xx the engine turns
+        // into the empty recognition) is judged ONCE — gated under the vlm
+        // source so it is not re-offered every sweep (expensive against a paid
+        // endpoint) — and re-tried only after a describe fingerprint change
+        // (clear_gated(vlm)), exactly like a stored row re-derives. Pins the
+        // 4xx negative-cache path explicitly (the existing gated test covers
+        // only the below-substance drop).
+        crate::runtime::block_on(async {
+            let dir = temp_dir();
+            let kernel = Kernel::open(
+                dir.join("c.anki2").to_str().unwrap(),
+                dir.join("cache").to_str().unwrap(),
+            )
+            .await
+            .unwrap();
+            kernel.attach_embedder(Arc::new(HashEmbedder), None);
+            kernel.reindex_if_needed().await.unwrap();
+
+            // One note, two images: one the endpoint 4xx-rejects, one it
+            // describes fine — so the failed item and a healthy item share a
+            // sweep (proving the failure doesn't sink the batch).
+            let notes = vec![serde_json::json!({"note_type": "Basic", "deck": "Default",
+                "fields": {"Front":
+                    "<img src=\"bad.png\"> <img src=\"good.png\">", "Back": "b"}})];
+            upsert_wire(
+                &kernel,
+                serde_json::json!(notes).to_string(),
+                "error".to_string(),
+                false,
+            )
+            .await;
+
+            let mut media = std::collections::HashMap::new();
+            // The condemned image's bytes carry the "oversized" sentinel; the
+            // healthy one does not.
+            media.insert("bad.png".to_string(), b"opaque oversized bytes".to_vec());
+            media.insert("good.png".to_string(), b"opaque ok bytes".to_vec());
+            let items_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let recognizer = Arc::new(PerItemFailingDescribe {
+                fail_marker: b"oversized".to_vec(),
+                prose: "a clear photograph of rolling green hills under a blue sky".to_string(),
+                fingerprint: std::sync::Mutex::new("describe:v1".to_string()),
+                items_seen: Arc::clone(&items_seen),
+            });
+            kernel.attach_recognizer_with(
+                recognize::RecognitionPurpose::Describe,
+                recognizer.clone(),
+                Arc::new(MapResolver::new(media)),
+            );
+            let seen = || items_seen.load(std::sync::atomic::Ordering::SeqCst);
+
+            // Sweep 1: both images recognized; the good one stored, the failed
+            // one gated (Drop) — nothing remains.
+            let report = kernel.recognize_pending(10).await.unwrap();
+            assert_eq!(
+                report,
+                recognize::SweepReport::Ran {
+                    recognized: 2,
+                    stored: 1,
+                    remaining: 0
+                }
+            );
+            assert_eq!(seen(), 2);
+
+            // Sweep 2: idle — the 4xx'd item is DONE (negative-cached), NOT
+            // re-offered. The recognizer is never called again.
+            let again = kernel.recognize_pending(10).await.unwrap();
+            assert_eq!(again, recognize::SweepReport::Idle);
+            assert_eq!(
+                seen(),
+                2,
+                "the 4xx'd item must not be re-offered each sweep"
+            );
+
+            // The describe prose still mints a VectorOnly vector (the healthy
+            // item) — the failure didn't regress describe routing.
+            let sem = kernel
+                .search("rolling green hills blue sky", 5)
+                .await
+                .unwrap();
+            assert!(
+                sem.iter()
+                    .any(|h| h.signals.iter().any(|(s, _)| s == "text")),
+                "the good describe vector is searchable"
+            );
+
+            // Engine upgrade: a fingerprint change clears the vlm markers, so
+            // the previously-failed item RE-ENTERS the pending set (the new
+            // engine may handle what the old rejected) — both re-offered.
+            *recognizer.fingerprint.lock().unwrap() = "describe:v2".to_string();
+            let retried = kernel.recognize_pending(10).await.unwrap();
+            assert!(
+                matches!(retried, recognize::SweepReport::Ran { recognized: 2, .. }),
+                "a fingerprint change re-tries the negative-cached item: {retried:?}"
+            );
+            assert_eq!(
+                seen(),
+                4,
+                "both items re-offered after the fingerprint change"
+            );
+
+            kernel.close().await.unwrap();
+            std::fs::remove_dir_all(dir).ok();
+        });
+    }
+
+    /// A describe recognizer whose CHUNK fails (an endpoint/transport error) —
+    /// the load-bearing contrast with the per-item failure: the whole chunk
+    /// Err's, so nothing is persisted or gated and the backlog stays pending.
+    struct ChunkErroringDescribe;
+
+    impl Recognizer for ChunkErroringDescribe {
+        fn recognize(
+            &self,
+            _items: Vec<MediaItem>,
+        ) -> BoxFuture<'_, NativeResult<Vec<Recognition>>> {
+            Box::pin(async move {
+                Err(NativeError::unavailable(
+                    "describe request failed: connection refused".to_string(),
+                ))
+            })
+        }
+
+        fn fingerprint(&self) -> Option<String> {
+            Some("describe:down:v1".to_string())
+        }
+    }
+
+    #[test]
+    fn endpoint_level_failure_does_not_negative_cache_and_leaves_backlog_pending() {
+        // #485 PR2 item 4 boundary: an ENDPOINT-level failure (transport/auth/
+        // exhausted retries) must NOT gate the item — it Err's the chunk before
+        // any persist or fingerprint advance, so the backlog stays pending and
+        // a later sweep (once the endpoint is up) retries. The negative cache
+        // is for per-item PERMANENT failures only.
+        crate::runtime::block_on(async {
+            let dir = temp_dir();
+            let kernel = Kernel::open(
+                dir.join("c.anki2").to_str().unwrap(),
+                dir.join("cache").to_str().unwrap(),
+            )
+            .await
+            .unwrap();
+            kernel.attach_embedder(Arc::new(HashEmbedder), None);
+            kernel.reindex_if_needed().await.unwrap();
+
+            let notes = vec![serde_json::json!({"note_type": "Basic", "deck": "Default",
+                "fields": {"Front": "<img src=\"photo.png\">", "Back": "b"}})];
+            upsert_wire(
+                &kernel,
+                serde_json::json!(notes).to_string(),
+                "error".to_string(),
+                false,
+            )
+            .await;
+
+            let mut media = std::collections::HashMap::new();
+            media.insert("photo.png".to_string(), b"opaque bytes".to_vec());
+            kernel.attach_recognizer_with(
+                recognize::RecognitionPurpose::Describe,
+                Arc::new(ChunkErroringDescribe),
+                Arc::new(MapResolver::new(media)),
+            );
+
+            // The sweep aborts with the chunk Err — nothing gated, nothing
+            // stored. The describe fingerprint meta is NOT advanced.
+            let err = kernel.recognize_pending(10).await.unwrap_err();
+            assert!(
+                err.to_string().contains("describe request failed"),
+                "the endpoint error propagates: {err}"
+            );
+
+            // Swap in a working engine with the SAME fingerprint (the endpoint
+            // came back up): the item is STILL pending — it was never gated —
+            // so it recognizes now. A negative cache would have wrongly skipped
+            // it.
+            kernel.attach_recognizer_with(
+                recognize::RecognitionPurpose::Describe,
+                Arc::new(ProseRecognizer::new(
+                    "a recovered description of the photo",
+                    "describe:down:v1",
+                )),
+                Arc::new(MapResolver::new({
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("photo.png".to_string(), b"opaque bytes".to_vec());
+                    m
+                })),
+            );
+            let report = kernel.recognize_pending(10).await.unwrap();
+            assert_eq!(
+                report,
+                recognize::SweepReport::Ran {
+                    recognized: 1,
+                    stored: 1,
+                    remaining: 0
+                },
+                "the un-gated item was still pending and recognized on recovery"
+            );
 
             kernel.close().await.unwrap();
             std::fs::remove_dir_all(dir).ok();
