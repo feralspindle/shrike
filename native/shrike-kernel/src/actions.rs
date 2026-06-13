@@ -521,6 +521,41 @@ use shrike_store_api::{DerivedStore, VectorIndex};
 /// One source's per-modality semantic rankings (`search_by_modality`'s row).
 type ModalityHits = std::collections::BTreeMap<String, (Vec<i64>, Vec<f32>)>;
 
+/// One SECONDARY embedding space's already-embedded + already-searched semantic
+/// results, fed into cross-space fusion (#234). The PRIMARY text space's hits
+/// ride the existing `vectors`/`index` path (unchanged, host-supplied); each
+/// secondary text-capable space embeds the query with ITS OWN model and
+/// searches ITS OWN engine at the kernel level, then hands the per-source rows
+/// here as data — so `search_notes` stays the pure fusion assembly and never
+/// holds N engines.
+///
+/// Empty `cross_space` (the N=1 / single-space case) → the rankings vector fed
+/// to `rrf_fuse` is EXACTLY the per-modality set today, so the fused output is
+/// byte-identical.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SpaceSemantic {
+    /// The space's CONTENT fingerprint — surfaced in per-space provenance
+    /// (#182) only when N≥2 (vacuous/absent at N=1).
+    pub space_key: String,
+    /// One entry per search source, in `sources` order.
+    pub per_source: Vec<SpaceSourceHits>,
+}
+
+/// One secondary space's per-source search result: its per-modality hits plus
+/// the raw best query→match cosine the RELATIVE activation gate (#234) reads
+/// BEFORE RRF strips magnitude.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SpaceSourceHits {
+    /// This space's `search_by_modality` row for the source (its own engine,
+    /// its own query embedding).
+    pub modality_hits: ModalityHits,
+    /// The space's best query→match cosine for this source (`1 - rank-1
+    /// distance`, over the NOTE-item modalities). `None` = the space returned
+    /// no hits. The relative gate fires this space only when this clears the
+    /// PRIMARY text space's best query cosine for the same source.
+    pub best_query_cosine: Option<f64>,
+}
+
 /// Anki search-language specials, escaped for the `"*text*"` wildcard
 /// pre-filter (mirrors `collection._escape_anki_text`).
 fn escape_anki_text(text: &str) -> String {
@@ -633,6 +668,19 @@ pub struct SearchArgs {
     /// stored for provenance + reconcile but never surfaced on a lexical
     /// query. EMPTY (the default) = nothing hidden, the pre-#485 behaviour.
     pub hidden_lexical_sources: Vec<String>,
+    /// SECONDARY embedding spaces' semantic results for cross-space fusion
+    /// (#234), one per space, each already embedded + searched at the kernel
+    /// level. EMPTY (the default) is the N=1 / single-space case — the rankings
+    /// fed to `rrf_fuse` are then EXACTLY today's per-modality set, so the fused
+    /// output is byte-identical. Non-empty appends each space's gated `image`
+    /// ranking (the relative activation gate, below).
+    pub cross_space: Vec<SpaceSemantic>,
+    /// Disable the cross-space relative activation gate (#234) — the NEGATIVE
+    /// CONTROL only. `false` (the default) keeps the mandatory gate on; `true`
+    /// fires every secondary space's image ranking ungated, which the eval
+    /// showed floods text queries and regresses text recall (the load-bearing
+    /// 0.08-vs-1.00 separation a test pins). Never set in production.
+    pub disable_cross_space_gate: bool,
 }
 
 /// Insertion-ordered candidate cache: Python dict iteration order is part of
@@ -707,6 +755,35 @@ fn read_notes_batch(
             HashMap::new()
         }
     }
+}
+
+/// The fusion signal name for a SECONDARY vision space's image ranking (#234):
+/// `image#<space-key>`. Distinct per space so provenance identifies which
+/// vision space surfaced a note and each space fuses as its own RRF signal
+/// (the canonical `search_weights` has no entry → `rrf_fuse` defaults its weight
+/// to 1.0, the eval's equal weighting). Never collides with the primary's plain
+/// `image` signal, so N=1 (no secondary) emits exactly today's signal set.
+pub fn cross_space_signal(space_key: &str) -> String {
+    format!("image#{space_key}")
+}
+
+/// The best (highest) query→match cosine across a space's NOTE-item modalities
+/// for one source — `1 - rank-1 distance`, maxed over `text`/`image` (#234). The
+/// relative cross-space activation gate compares a vision space's value to the
+/// dedicated text space's value for the same query. `None` when the space
+/// returned no note-item hits. The rank-1 distance is the smallest (the engine
+/// returns distance-ascending), so this reads `[0]`.
+///
+/// Public so the kernel's cross-space fan-out captures each SECONDARY space's
+/// value as it searches (the gate input rides into `SpaceSourceHits`).
+pub fn best_query_cosine_of(
+    hits: &std::collections::BTreeMap<String, (Vec<i64>, Vec<f32>)>,
+) -> Option<f64> {
+    crate::NOTE_MODALITIES
+        .iter()
+        .filter_map(|m| hits.get(*m).and_then(|(_, dists)| dists.first()))
+        .map(|d| 1.0 - f64::from(*d))
+        .fold(None, |acc, c| Some(acc.map_or(c, |a: f64| a.max(c))))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1124,13 +1201,83 @@ pub fn search_notes(
             fuzzy_evidence.retain(|nid, _| !exact_set.contains(nid));
         }
 
-        let rankings: Vec<(String, Vec<i64>)> = vec![
+        let mut rankings: Vec<(String, Vec<i64>)> = vec![
             ("text".into(), ranking_text),
             ("image".into(), ranking_image),
             ("tag".into(), ranking_tag),
             ("exact".into(), exact_ids),
             ("fuzzy".into(), ranking_fuzzy),
         ];
+
+        // ── Cross-space fusion (#234) ────────────────────────────────────────
+        // Each SECONDARY text-capable space contributes its own gated `image`
+        // ranking. EMPTY cross_space (N=1) → this whole block is a no-op and the
+        // rankings vector above is byte-identical to today, so `rrf_fuse` gets
+        // identical inputs. The relative activation gate (the eval's mandatory
+        // finding) fires a vision space ONLY when its best query→match cosine
+        // clears the PRIMARY text space's best for this same source.
+        if !args.cross_space.is_empty() {
+            // The primary text space's best query cosine (the gate's reference).
+            // The primary's hits are `modality_hits` (this source's row).
+            let primary_best = best_query_cosine_of(modality_hits);
+            for space in &args.cross_space {
+                let Some(shits) = space.per_source.get(i) else {
+                    continue;
+                };
+                // The relative gate (default): the vision space fires only when
+                // its best query cosine ≥ the primary text space's. With the
+                // gate disabled (the negative control), every space fires.
+                let gate_open = args.disable_cross_space_gate
+                    || match (shits.best_query_cosine, primary_best) {
+                        (Some(v), Some(p)) => v >= p,
+                        // No primary text reference → nothing to gate against;
+                        // admit the space (degenerate, lexical-only primary).
+                        (Some(_), None) => true,
+                        // The space itself returned no hits → nothing to add.
+                        (None, _) => false,
+                    };
+                if !gate_open {
+                    continue;
+                }
+                let (sk, sd) = shits
+                    .modality_hits
+                    .get("image")
+                    .map(|(k, d)| (k.as_slice(), d.as_slice()))
+                    .unwrap_or((&[], &[]));
+                if sk.is_empty() {
+                    continue;
+                }
+                let mut space_score: HashMap<i64, f64> = HashMap::new();
+                let ranking_space_image = rank_modality(
+                    core,
+                    sk,
+                    sd,
+                    &mut note_data,
+                    &mut space_score,
+                    &exclude,
+                    args,
+                    false,
+                );
+                if ranking_space_image.is_empty() {
+                    continue;
+                }
+                // Fold the space's image cosines into the displayed semantic
+                // `score` (max-over-items, exactly like the primary image).
+                for (nid, isim) in &space_score {
+                    let entry = sem_score.entry(*nid).or_insert(*isim);
+                    if *isim > *entry {
+                        *entry = *isim;
+                    }
+                }
+                // A DISTINCT signal name per space so provenance (#182)
+                // identifies which vision space surfaced the note, and each
+                // space fuses as its own RRF signal (weight defaults to 1.0 —
+                // the eval's equal weighting). `image#<key>` reads as "the image
+                // modality of space <key>".
+                rankings.push((cross_space_signal(&space.space_key), ranking_space_image));
+            }
+        }
+
         // Host-supplied weights override; empty means the kernel's canonical
         // set (#388 — the one source of truth in `fusion`).
         let weights = if args.weights.is_empty() {
@@ -1217,6 +1364,13 @@ mod search_tests {
             text: text.to_owned(),
             is_query: true,
         }
+    }
+
+    /// Unit vector at exact cosine `1 - d` against the `[1, 0]` query (the
+    /// cross-space tests plant primary text vectors at known cosines).
+    fn at_distance(d: f32) -> Vec<f32> {
+        let sim = 1.0 - d;
+        vec![sim, (1.0 - sim * sim).max(0.0).sqrt()]
     }
 
     #[test]
@@ -1457,6 +1611,267 @@ mod search_tests {
         // An explicit-null content (a meta-mode note dict under plain serde,
         // #391 to_wire retirement) is treated exactly like absent.
         assert!(substring_info(Some(&serde_json::Value::Null), "x").is_null());
+    }
+
+    // ── Cross-space fusion + the relative activation gate (#234) ─────────────
+    //
+    // These productionize the #231 eval's load-bearing findings against
+    // `search_notes` DIRECTLY (no host wiring needed): the gate PRESERVES
+    // text-target ranking, the negative control (gate OFF) REGRESSES it, and a
+    // gated vision space DELIVERS image recall. The two spaces are a primary
+    // text engine (planted vectors) + a secondary space's pre-searched
+    // `SpaceSemantic` rows — exactly the shape `build_cross_space` produces.
+
+    /// One secondary space's `SpaceSemantic` carrying image-modality hits for a
+    /// single source, with the best query cosine the relative gate reads.
+    fn vision_space(key: &str, image_keys: &[i64], image_dists: &[f32]) -> SpaceSemantic {
+        let best = image_dists
+            .iter()
+            .copied()
+            .fold(None, |acc: Option<f64>, d| {
+                let c = 1.0 - f64::from(d);
+                Some(acc.map_or(c, |a| a.max(c)))
+            });
+        let mut hits = ModalityHits::new();
+        hits.insert(
+            "image".to_owned(),
+            (image_keys.to_vec(), image_dists.to_vec()),
+        );
+        SpaceSemantic {
+            space_key: key.to_owned(),
+            per_source: vec![SpaceSourceHits {
+                modality_hits: hits,
+                best_query_cosine: best,
+            }],
+        }
+    }
+
+    /// args with semantic on, a 0.0 threshold (so the planted text vector always
+    /// ranks), and the canonical (empty → kernel-default) weights so the
+    /// cross-space `image#<key>` signal gets weight 1.0 like the eval.
+    fn cross_args(top_k: usize) -> SearchArgs {
+        SearchArgs {
+            top_k,
+            threshold: 0.0,
+            semantic: true,
+            index_size: 8,
+            weights: std::collections::BTreeMap::new(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cross_space_gated_preserves_text_target() {
+        // (a) The eval's "fully preserved": with the relative gate ON, an
+        // OFF-TOPIC vision space (its best image cosine BELOW the primary text
+        // space's best) does NOT fire — the text-target note stays rank-1, the
+        // dedicated-text baseline. The gate is closed because vision < text.
+        let (dir, core) = temp_collection();
+        let text_target = add_note(&core, "the krebs cycle oxidizes acetyl coa", "biology");
+        let image_note = add_note(&core, "unrelated filler card", "misc");
+
+        let index = MultiModalIndex::new(vec!["text".to_owned(), "image".to_owned()]).unwrap();
+        // The query matches the text-target strongly (cos 0.9) in the primary.
+        index
+            .add("text", &[text_target], &[at_distance(0.1)])
+            .unwrap();
+
+        // BASELINE: text-only (no cross-space) — the text note is rank-1.
+        let groups = search_notes(
+            &core,
+            Some(&index),
+            None,
+            None,
+            &[query("krebs cycle energy metabolism")],
+            &[vec![1.0, 0.0]],
+            &cross_args(10),
+        )
+        .unwrap();
+        assert_eq!(groups[0].matches[0].note.id, text_target, "baseline rank-1");
+
+        // GATED cross-space: the vision space's best image cosine (0.30) is far
+        // BELOW the primary text space's best (0.90) → the relative gate keeps
+        // it OUT. Text-target ranking is byte-for-byte the baseline.
+        let mut a = cross_args(10);
+        a.cross_space = vec![vision_space("clip", &[image_note], &[0.70])]; // cos 0.30
+        let gated = search_notes(
+            &core,
+            Some(&index),
+            None,
+            None,
+            &[query("krebs cycle energy metabolism")],
+            &[vec![1.0, 0.0]],
+            &a,
+        )
+        .unwrap();
+        assert_eq!(
+            gated[0].matches[0].note.id, text_target,
+            "the gate preserved the text-target rank-1 (vision < text → closed)"
+        );
+        // The image note never entered (the gate dropped the whole vision space).
+        assert!(
+            !gated[0].matches.iter().any(|m| m.note.id == image_note),
+            "off-topic image note stayed out"
+        );
+        core.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn cross_space_ungated_regresses_text_negative_control() {
+        // (b) THE NEGATIVE CONTROL — the eval's load-bearing finding (text R@1
+        // collapse, the 0.08-vs-1.00 separation), productionized. The query is
+        // ON-TOPIC for text: the text-target is the correct rank-1, and the
+        // off-topic image note's vision cosine is BELOW the text-target's — so
+        // the relative gate SHOULD keep the image note OUT. With the gate
+        // DISABLED, the image note floods in across multiple always-on vision
+        // spaces and out-fuses the correct text note. The gate's whole job is to
+        // prevent exactly this; turning it off reproduces the regression.
+        let (dir, core) = temp_collection();
+        let text_target = add_note(&core, "the krebs cycle oxidizes acetyl coa", "biology");
+        let off_topic_image = add_note(
+            &core,
+            "an unrelated diagram whose content is in its image",
+            "img",
+        );
+
+        let index = MultiModalIndex::new(vec!["text".to_owned(), "image".to_owned()]).unwrap();
+        // Primary: the text-target matches STRONGLY (cos 0.8) — the correct
+        // rank-1 for this text query.
+        index
+            .add("text", &[text_target], &[at_distance(0.2)])
+            .unwrap();
+
+        // Two always-on vision spaces, each surfacing the OFF-TOPIC image note
+        // at a vision cosine (0.7) BELOW the text-target's (0.8) — so the
+        // relative gate would close BOTH. Ungated, the image note accumulates
+        // across two `image#…` signals (2× RRF mass) and out-fuses the
+        // text-target's single `text` signal.
+        let secondaries = vec![
+            vision_space("clip-a", &[off_topic_image], &[0.30]), // cos 0.70 < 0.80
+            vision_space("clip-b", &[off_topic_image], &[0.30]),
+        ];
+        let mut ungated_args = cross_args(10);
+        ungated_args.disable_cross_space_gate = true; // the control: gate OFF
+        ungated_args.cross_space = secondaries.clone();
+        let ungated = search_notes(
+            &core,
+            Some(&index),
+            None,
+            None,
+            &[query("krebs cycle energy metabolism")],
+            &[vec![1.0, 0.0]],
+            &ungated_args,
+        )
+        .unwrap();
+        // The regression: the off-topic image note tops the text-target (text
+        // R@1 collapses) — the always-on image signal flooded the fusion.
+        assert_eq!(
+            ungated[0].matches[0].note.id, off_topic_image,
+            "ungated: the always-on vision spaces flood and demote the text-target"
+        );
+        assert!(
+            ungated[0]
+                .matches
+                .iter()
+                .position(|m| m.note.id == text_target)
+                .map(|r| r > 0)
+                .unwrap_or(true),
+            "ungated: the text-target is no longer rank-1 (the regression)"
+        );
+
+        // THE SAME inputs WITH the relative gate ON: both vision spaces close
+        // (vision 0.70 < text 0.80), the off-topic image note is excluded, and
+        // the text-target is restored to rank-1 — the dedicated-text baseline.
+        // This is the load-bearing contrast: the gate IS what prevents (b).
+        let mut gated_args = ungated_args.clone();
+        gated_args.disable_cross_space_gate = false;
+        let gated = search_notes(
+            &core,
+            Some(&index),
+            None,
+            None,
+            &[query("krebs cycle energy metabolism")],
+            &[vec![1.0, 0.0]],
+            &gated_args,
+        )
+        .unwrap();
+        assert_eq!(
+            gated[0].matches[0].note.id, text_target,
+            "gated: the text-target is rank-1 again (the gate closed the off-topic vision spaces)"
+        );
+        assert!(
+            !gated[0]
+                .matches
+                .iter()
+                .any(|m| m.note.id == off_topic_image),
+            "gated: the off-topic image note is kept out (vision < text → closed)"
+        );
+        core.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn cross_space_gate_open_delivers_image_recall() {
+        // (c) The payoff: a text query whose answer lives in a card's IMAGE
+        // surfaces it through the gated vision space — the vision space's best
+        // image cosine (0.92) CLEARS the primary text space's best (0.55), so
+        // the relative gate OPENS and the image-bearing note joins the fusion
+        // via its `image#clip` signal. (Without cross-space, the text-only
+        // primary never sees it.)
+        let (dir, core) = temp_collection();
+        let weak_text = add_note(&core, "a loosely related text card", "text");
+        let image_note = add_note(&core, "card whose answer is only in the picture", "img");
+
+        let index = MultiModalIndex::new(vec!["text".to_owned(), "image".to_owned()]).unwrap();
+        // Primary text: only a WEAK match (cos 0.55), and the image note has no
+        // text vector at all → text-only would surface only weak_text.
+        index
+            .add("text", &[weak_text], &[at_distance(0.45)])
+            .unwrap();
+
+        // Without cross-space: the image note is absent.
+        let baseline = search_notes(
+            &core,
+            Some(&index),
+            None,
+            None,
+            &[query("the content shown in the diagram")],
+            &[vec![1.0, 0.0]],
+            &cross_args(10),
+        )
+        .unwrap();
+        assert!(
+            !baseline[0].matches.iter().any(|m| m.note.id == image_note),
+            "text-only never surfaces the image-only note"
+        );
+
+        // With the gated vision space (cos 0.92 ≥ 0.55 → gate OPEN): the image
+        // note surfaces, tagged with the per-space provenance signal.
+        let mut a = cross_args(10);
+        a.cross_space = vec![vision_space("clip", &[image_note], &[0.08])]; // cos 0.92
+        let crossed = search_notes(
+            &core,
+            Some(&index),
+            None,
+            None,
+            &[query("the content shown in the diagram")],
+            &[vec![1.0, 0.0]],
+            &a,
+        )
+        .unwrap();
+        let img = crossed[0]
+            .matches
+            .iter()
+            .find(|m| m.note.id == image_note)
+            .expect("the image-bearing note is delivered via the gated vision space");
+        // Per-space provenance (#182): the surfacing signal is `image#clip`.
+        assert!(
+            img.provenance.iter().any(|p| p.signal == "image#clip"),
+            "the match carries its vision space's per-space provenance"
+        );
+        core.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
     }
 }
 
