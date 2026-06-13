@@ -110,7 +110,10 @@ _EMBEDDING = [
     "test_embedding_remote.py",
 ]
 
-_ACTIONS = ["test_actions_registry.py"]
+_ACTIONS = [
+    "test_actions_registry.py",
+    "test_list_profiles.py",
+]
 
 # test_collection_busy reaches through mcp_adapter (the busy → _safe_tool
 # normalization); test_recognition rides here rather than alone because on the
@@ -140,8 +143,10 @@ _SERVER = [
 ]
 
 _CONFIG = [
+    "test_anki_discovery.py",
     "test_config.py",
     "test_profiles.py",
+    "test_registry.py",
 ]
 
 _CLI = [
@@ -154,6 +159,7 @@ _CLI = [
     "test_cli_migrate_type.py",
     "test_cli_note_replace.py",
     "test_cli_note_tag.py",
+    "test_cli_profile.py",
     "test_cli_server.py",
     "test_cli_type_info_output.py",
     "test_note_cmd.py",
@@ -256,6 +262,7 @@ pytest_test(
     deps = [
         ":conftest",
         "//src/shrike:actions",
+        "//src/shrike:registry",  # test_list_profiles builds a Registry snapshot directly
     ],
 )
 
