@@ -59,8 +59,9 @@ class TestHarness:
             assert status["embedding"]["state"] == "not_configured"
             assert status["index"]["state"] == "unavailable"
             assert status["locking"] == "permanent"
-            # Recognition is off until a backend is configured (#228).
-            assert status["recognition"] == {"state": "unavailable", "backend": None}
+            # Recognition is off until a backend is configured (#228/#485): the
+            # keyed-by-source map is empty (distinct from attached-but-errored).
+            assert status["recognition"] == {}
             # The coverage matrix (#498/#235): shape-stable, all-False with
             # embedding down — no modality is semantically searchable.
             assert status["coverage"] == {"text": False, "image": False, "audio": False}
@@ -360,10 +361,77 @@ class TestRecognition:
 
             harness.start_recognition("nope")
             status = await harness.status()
-            assert status["recognition"]["state"] == "error"
+            # An unknown OCR kind lands an 'error' row under the ocr source
+            # (#485): the engine is attached-but-errored, not absent.
+            assert status["recognition"]["ocr"]["state"] == "error"
             await harness.close()
 
         asyncio.run(flow())
+
+    def test_start_recognition_describe_missing_key_env_is_an_error_row(self, tmp_path) -> None:
+        # #485 PR1: a missing api_key_env raises a RuntimeError the boot path
+        # catches → an 'error' row keyed by the vlm source, with NO network
+        # probe and NO attach. The per-engine /status map populates without
+        # disturbing boot, and OCR is untouched (the vlm error adds no ocr row).
+        async def flow():
+            media = {"x.png": b"text"}
+            harness = await self._describe_harness(tmp_path, media)
+
+            harness.start_recognition_describe(
+                "http://127.0.0.1:9", api_key_env="SHRIKE_TEST_DESCRIBE_KEY_UNSET_XYZ"
+            )
+            status = await harness.status()
+            assert status["recognition"]["vlm"]["state"] == "error"
+            assert status["recognition"]["vlm"]["backend"] == "describe-remote"
+            assert "ocr" not in status["recognition"]
+            await harness.close()
+
+        asyncio.run(flow())
+
+    def test_start_recognition_describe_unreachable_endpoint_reports_error(self, tmp_path) -> None:
+        # #485 PR1 (follow-up B): an endpoint that answers NEITHER /health nor
+        # /v1/models (a closed port) is reported as an 'error' engine row — a
+        # degraded engine must be visible, not silently 'ready'. The engine
+        # still ATTACHES (the row carries its degenerate fingerprint), so the
+        # backlog stays pending per the chunk-Err-aborts contract until a sweep
+        # reaches the endpoint.
+        async def flow():
+            media = {"x.png": b"text"}
+            harness = await self._describe_harness(tmp_path, media)
+
+            # Port 9 (discard) is closed → health_ok() False and model_info()
+            # empty → reachable False → an 'error' row that nonetheless carries
+            # a (degenerate) fingerprint, proving the engine attached.
+            harness.start_recognition_describe("http://127.0.0.1:9")
+            status = await harness.status()
+            assert status["recognition"]["vlm"]["state"] == "error"
+            assert status["recognition"]["vlm"]["backend"] == "describe-remote"
+            assert status["recognition"]["vlm"]["fingerprint"], (
+                "the engine attached with a (degenerate) fingerprint"
+            )
+            assert status["recognition"]["vlm"]["fingerprint"].endswith(":prompt=1")
+            await harness.close()
+
+        asyncio.run(flow())
+
+    @staticmethod
+    async def _describe_harness(tmp_path, media):
+        runtime = EmbeddingRuntime(model=None)
+        derived = DerivedTextStore(
+            path=tmp_path / "cache" / "shrike.db", engine_factory=NativeDerivedEngine
+        )
+        harness = await Harness.assemble(
+            collection_path=str(tmp_path / "collection.anki2"),
+            cache_dir=str(tmp_path / "cache"),
+            runtime=runtime,
+            derived=derived,
+            cooperative=False,
+            hold_seconds=5.0,
+            media_read=media.get,
+            media_exists=lambda name: name in media,
+        )
+        await harness.boot(start_embedding=False)
+        return harness
 
 
 class TestDedupOverOcr:
@@ -455,3 +523,301 @@ class TestDedupOverOcr:
             await harness.close()
 
         asyncio.run(flow())
+
+
+class _StubDescribe:
+    """A captured describe recognizer (#485, the PyRecognizer wire contract):
+    canned generated prose under the kernel's ``vlm`` purpose. Distinct
+    fingerprint from OCR so the two engines key their meta independently."""
+
+    def __init__(self, prose: str) -> None:
+        self._prose = prose
+
+    def recognize(self, items: list[bytes]) -> list[tuple[str, float, str]]:
+        # One description per image; confidence 1.0 (substance gates it), no
+        # segments (a description locates nothing).
+        return [(self._prose, 1.0, "") for _ in items]
+
+    def model_fingerprint(self) -> str:
+        return "describe:stub:v1"
+
+
+class TestDescribeAttach:
+    def test_describe_routes_vector_only_through_the_binding_search(self, tmp_path) -> None:
+        # #485 PR1: a describe recognizer attached for the ``vlm`` purpose mints
+        # a TEXT-space vector for its generated prose (semantically searchable)
+        # but its prose is NEVER reachable via the LEXICAL surfaces (exact /
+        # fuzzy) — the VectorOnly destination, proven through the SAME pyo3
+        # search path the server serves (`harness.kernel.search`, the fused
+        # exact/fuzzy/text ranking), not just at the kernel layer #538 covered.
+        # OCR alongside it stays lexically searchable (byte-identical routing).
+        import hashlib
+        from types import SimpleNamespace
+
+        from shrike.harness import KernelIndexView
+
+        class _TokenHash:
+            """Token-overlap cosine: shared words → similarity (no model)."""
+
+            def embed_texts(self, texts: list[str]) -> list[list[float]]:
+                out = []
+                for t in texts:
+                    v = [0.0] * 64
+                    for tok in t.lower().split():
+                        h = int(hashlib.blake2b(tok.encode(), digest_size=2).hexdigest(), 16)
+                        v[h % 64] += 1.0
+                    n = sum(x * x for x in v) ** 0.5 or 1.0
+                    out.append([x / n for x in v])
+                return out
+
+            def model_fingerprint(self) -> str:
+                return "tok:v1"
+
+            def embedding_dim(self) -> int:
+                return 64
+
+        # The describe prose: a literal phrase ("sunlit mountain valley") that
+        # lives ONLY here — never in the note's field text or the OCR text — so
+        # a lexical hit on it could ONLY come from the describe row. The token
+        # bag also overlaps a non-literal semantic query.
+        describe_prose = "a photograph of a sunlit mountain valley with grazing cattle at dawn"
+
+        async def flow():
+            # The OCR text is distinct visible text; the field text shares
+            # nothing with either, so each signal's provenance is unambiguous.
+            media = {"photo.png": b"figure 7 chlorophyll absorption spectrum"}
+            runtime = EmbeddingRuntime(model=None)
+            derived = DerivedTextStore(
+                path=tmp_path / "cache" / "shrike.db", engine_factory=NativeDerivedEngine
+            )
+            harness = await Harness.assemble(
+                collection_path=str(tmp_path / "collection.anki2"),
+                cache_dir=str(tmp_path / "cache"),
+                runtime=runtime,
+                derived=derived,
+                cooperative=False,
+                hold_seconds=5.0,
+                media_read=media.get,
+                media_exists=lambda name: name in media,
+            )
+            await harness.boot(start_embedding=False)
+            backend = _TokenHash()
+            harness.kernel.attach_embedder(shrike_native.PyEmbedder.capture(backend))
+            await harness.kernel.reindex_if_needed()
+
+            notes = await harness.wrapper.upsert_notes(
+                [
+                    {
+                        "note_type": "Basic",
+                        "deck": "Default",
+                        "fields": {"Front": 'zzz qqq <img src="photo.png">', "Back": "b"},
+                    }
+                ]
+            )
+            photo_id = notes[0]["id"]
+
+            # Both engines over the one image: OCR (lexical + vector) and
+            # describe (the captured stub, vector-only) — attached for their
+            # own purposes through the binding's purpose-aware attach.
+            harness.attach_recognizer(_StubOcr2("figure 7 chlorophyll absorption spectrum"), "ocr")
+            harness.attach_recognizer(_StubDescribe(describe_prose), "vlm")
+            # NB: attach_recognizer (the low-level seam these stubs use) does
+            # not touch the /status engine map — that's owned by
+            # start_recognition[_describe], exercised in the profiles/boot
+            # tests. Here the kernel-level attach is what we assert routing on.
+
+            report = await harness.recognition_sweep(batch_size=4)
+            # Two recognized (OCR + describe over the one image), both stored.
+            assert report["total_stored"] == 2, report
+
+            # (1) The describe prose mints a TEXT vector: a non-literal token-bag
+            # query (no shared literal substring with anything stored) surfaces
+            # the note through the `text` signal in the FUSED binding search.
+            sem = await harness.kernel.search("mountain valley cattle grazing dawn", 5)
+            sem_hit = next((h for h in sem if h[0] == photo_id), None)
+            assert sem_hit is not None, "describe vector ranks in the fused search"
+            signals = {s for s, _ in sem_hit[2]}
+            assert "text" in signals, f"the describe vector mints a text signal: {signals}"
+
+            # (2) The describe prose is HIDDEN from the lexical surfaces: a
+            # literal phrase that lives ONLY in the describe prose must not hit
+            # on `exact` or `fuzzy` through the binding search (VectorOnly).
+            lex = await harness.kernel.search("sunlit mountain valley", 5)
+            lex_hit = next((h for h in lex if h[0] == photo_id), None)
+            if lex_hit is not None:
+                lex_signals = {s for s, _ in lex_hit[2]}
+                assert "exact" not in lex_signals and "fuzzy" not in lex_signals, (
+                    f"describe prose leaked into the lexical surfaces: {lex_signals}"
+                )
+
+            # (3) Contrast — OCR is byte-identical routing: its visible text IS
+            # lexically reachable (the `exact` signal) through the same search.
+            ocr = await harness.kernel.search("chlorophyll absorption spectrum", 5)
+            ocr_hit = next((h for h in ocr if h[0] == photo_id), None)
+            assert ocr_hit is not None, "OCR text searchable"
+            assert "exact" in {s for s, _ in ocr_hit[2]}, "OCR stays lexical (unchanged)"
+
+            # The describe row IS stored in the derived store (for provenance +
+            # reconcile — VectorOnly hides it from SEARCH, it isn't dropped):
+            # the low-level store facade (unfiltered by design — it is not a
+            # search entry point) sees both rows. The exclusion lives at the
+            # search path (asserted above via kernel.search), not at storage.
+            assert harness.derived.search_substring("chlorophyll absorption", limit=5)
+            assert harness.derived.search_substring("sunlit mountain valley", limit=5), (
+                "the describe row is stored (provenance + reconcile) even though search hides it"
+            )
+
+            # The dedup view (the other binding search seam) also surfaces the
+            # describe vector max-over-items — a query overlapping the prose
+            # finds the note even though its field text shares nothing.
+            view = KernelIndexView(harness.kernel, SimpleNamespace(backend=backend))  # type: ignore[arg-type]
+            hits = view.search(["sunlit mountain valley with grazing cattle"], top_k=5)[0]
+            assert any(h["note_id"] == photo_id for h in hits), (
+                "describe vector reachable through the dedup search path"
+            )
+
+            harness.detach_recognizer("vlm")
+            harness.detach_recognizer("ocr")
+            await harness.close()
+
+        asyncio.run(flow())
+
+    def test_describe_vector_only_through_the_search_notes_action(self, tmp_path) -> None:
+        # #485 PR1 (follow-up A): the VectorOnly invariant proven at the actual
+        # `search_notes` MCP ACTION path real clients hit — not just the kernel
+        # search. A literal phrase living ONLY in the describe prose returns the
+        # note (if at all) WITHOUT a `substring` annotation or an `exact`/`fuzzy`
+        # provenance signal; the OCR visible text DOES carry the `substring`
+        # annotation + `exact` signal. This closes the surface-level gap: the
+        # action threads `hidden_lexical_sources` into the native search, so a
+        # describe-source row can never surface a lexical hit to a client.
+        import hashlib
+        from types import SimpleNamespace
+
+        from mcp.server.fastmcp import FastMCP
+
+        from shrike.harness import KernelIndexView
+        from shrike.tools import register_tools
+
+        class _TokenHash:
+            def embed_texts(self, texts: list[str]) -> list[list[float]]:
+                out = []
+                for t in texts:
+                    v = [0.0] * 64
+                    for tok in t.lower().split():
+                        h = int(hashlib.blake2b(tok.encode(), digest_size=2).hexdigest(), 16)
+                        v[h % 64] += 1.0
+                    n = sum(x * x for x in v) ** 0.5 or 1.0
+                    out.append([x / n for x in v])
+                return out
+
+            def model_fingerprint(self) -> str:
+                return "tok:v1"
+
+            def embedding_dim(self) -> int:
+                return 64
+
+        describe_prose = "a photograph of a sunlit mountain valley with grazing cattle at dawn"
+
+        async def flow():
+            media = {"photo.png": b"figure 7 chlorophyll absorption spectrum"}
+            runtime = EmbeddingRuntime(model=None)
+            derived = DerivedTextStore(
+                path=tmp_path / "cache" / "shrike.db", engine_factory=NativeDerivedEngine
+            )
+            harness = await Harness.assemble(
+                collection_path=str(tmp_path / "collection.anki2"),
+                cache_dir=str(tmp_path / "cache"),
+                runtime=runtime,
+                derived=derived,
+                cooperative=False,
+                hold_seconds=5.0,
+                media_read=media.get,
+                media_exists=lambda name: name in media,
+            )
+            await harness.boot(start_embedding=False)
+            backend = _TokenHash()
+            harness.kernel.attach_embedder(shrike_native.PyEmbedder.capture(backend))
+            await harness.kernel.reindex_if_needed()
+
+            notes = await harness.wrapper.upsert_notes(
+                [
+                    {
+                        "note_type": "Basic",
+                        "deck": "Default",
+                        "fields": {"Front": 'zzz qqq <img src="photo.png">', "Back": "b"},
+                    }
+                ]
+            )
+            photo_id = notes[0]["id"]
+
+            harness.attach_recognizer(_StubOcr2("figure 7 chlorophyll absorption spectrum"), "ocr")
+            harness.attach_recognizer(_StubDescribe(describe_prose), "vlm")
+            report = await harness.recognition_sweep(batch_size=4)
+            assert report["total_stored"] == 2, report
+
+            # Register the REAL MCP action registry against the harness's
+            # surfaces (the search-facing KernelIndexView embeds queries with the
+            # same backend, like the server wires it), then drive search_notes —
+            # the exact path a client's tools/call reaches.
+            view = KernelIndexView(harness.kernel, SimpleNamespace(backend=backend))  # type: ignore[arg-type]
+            mcp = FastMCP("test")
+            register_tools(
+                mcp, harness.wrapper, index=view, kernel=harness.kernel, derived=harness.derived
+            )
+
+            async def search(q: str) -> list[dict]:
+                _, structured = await mcp.call_tool("search_notes", {"queries": [q]})
+                groups = structured["results"]
+                # One query → at most one group; flatten its matches.
+                return groups[0]["matches"] if groups else []
+
+            # (1) A query that is a VERBATIM literal substring of the describe
+            # prose AND a strong token overlap — so it surfaces the note via the
+            # describe `text` vector (a non-vacuous guard: the note IS present),
+            # yet must carry NO `substring` annotation and NO `exact`/`fuzzy`
+            # provenance signal through the action. If hidden_lexical_sources
+            # weren't threaded into the native search, this exact-substring query
+            # would mint an `exact` signal off the describe row — it must not.
+            desc_matches = await search("sunlit mountain valley with grazing cattle at dawn")
+            desc_hit = next((m for m in desc_matches if m["id"] == photo_id), None)
+            assert desc_hit is not None, "the describe vector surfaces the note via text"
+            desc_signals = {p["signal"] for p in desc_hit.get("provenance", [])}
+            assert "text" in desc_signals, f"reachable only via the vector: {desc_signals}"
+            assert desc_hit.get("substring") is None, (
+                f"describe prose leaked a substring annotation: {desc_hit.get('substring')}"
+            )
+            assert not (desc_signals & {"exact", "fuzzy"}), (
+                f"describe prose leaked a lexical signal through search_notes: {desc_signals}"
+            )
+
+            # (2) The OCR visible text: the note IS returned with a substring
+            # annotation + an exact provenance signal (byte-identical routing).
+            ocr_matches = await search("chlorophyll absorption spectrum")
+            ocr_hit = next((m for m in ocr_matches if m["id"] == photo_id), None)
+            assert ocr_hit is not None, "OCR text searchable through search_notes"
+            assert ocr_hit.get("substring") is not None, "OCR carries the substring annotation"
+            assert "exact" in {p["signal"] for p in ocr_hit.get("provenance", [])}, (
+                "OCR carries the exact provenance signal"
+            )
+
+            harness.detach_recognizer("vlm")
+            harness.detach_recognizer("ocr")
+            await harness.close()
+
+        asyncio.run(flow())
+
+
+class _StubOcr2:
+    """A captured OCR recognizer over canned visible text (the wire contract).
+    Separate from the bytes-echoing _StubOcr so the OCR text is independent of
+    the (opaque) image bytes in the describe test."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def recognize(self, items: list[bytes]) -> list[tuple[str, float, str]]:
+        return [(self._text, 0.9, "") for _ in items]
+
+    def model_fingerprint(self) -> str:
+        return "stub-ocr:v2"

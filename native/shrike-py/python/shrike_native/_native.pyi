@@ -273,6 +273,27 @@ class AppleVisionRecognizer:
     def model_fingerprint(self) -> str | None: ...
     def recognize(self, items: list[bytes]) -> list[tuple[str, float, str]]: ...
 
+@final
+class RemoteDescriber:
+    def __new__(
+        cls,
+        base_url: str,
+        *,
+        api_key: str | None = None,
+        model: str | None = None,
+        fingerprint: str | None = None,
+    ) -> RemoteDescriber: ...
+    @staticmethod
+    def compose_fingerprint(
+        model_id: str | None,
+        meta_json: str,
+        configured_model: str | None = None,
+        mmproj: str | None = None,
+    ) -> str: ...
+    def recognize(self, items: list[bytes]) -> list[tuple[str, float, str]]: ...
+    def health_ok(self) -> bool: ...
+    def model_info(self) -> tuple[str | None, str]: ...
+
 def embedder_probe(embedder: PyEmbedder, texts: list[str]) -> Future[list[list[float]]]: ...
 
 @final
@@ -294,11 +315,19 @@ class AsyncKernel:
     def detach_embedder(self) -> None: ...
     def attach_recognizer(
         self,
-        recognizer: AppleVisionRecognizer | Recognizer,
+        recognizer: AppleVisionRecognizer | RemoteDescriber | Recognizer,
+        media_read: Callable[[str], bytes | None],
+        media_exists: Callable[[str], bool],
+    ) -> None: ...
+    def attach_recognizer_with(
+        self,
+        purpose: str,
+        recognizer: AppleVisionRecognizer | RemoteDescriber | Recognizer,
         media_read: Callable[[str], bytes | None],
         media_exists: Callable[[str], bool],
     ) -> None: ...
     def detach_recognizer(self) -> None: ...
+    def detach_recognizer_for(self, purpose: str) -> None: ...
     def recognize_pending(self, max_items: int) -> Future[str]: ...
     def upsert_notes(
         self,

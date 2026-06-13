@@ -159,6 +159,147 @@ impl AppleVisionRecognizer {
     }
 }
 
+/// The remote VLM describe engine (#433/#485) as the Python-visible backend
+/// object: the recognizer-attach sibling of `RemoteEmbedder`. Construction
+/// validates the API key; the kernel attach path takes `engine_arc()` and
+/// adapts it onto the blocking pool via `Blocking` exactly like Apple Vision,
+/// so describe runs native end-to-end (engine → Blocking → the runtime's
+/// blocking pool), no Python on the sweep. `recognize` is the blocking wire
+/// shape for direct callers/tests; `health_ok`/`model_info` serve the host
+/// the raw ingredients it folds into the describe fingerprint
+/// (`compose_fingerprint` is host policy, mirrored in the crate).
+#[cfg(feature = "engine-remote")]
+#[pyclass(frozen)]
+pub(crate) struct RemoteDescriber {
+    engine: Arc<shrike_describe_remote::RemoteDescriber>,
+    /// The host-composed fingerprint (`describe:…:prompt=N`), folded into the
+    /// engine identity at attach. `None` on the probe construction the host
+    /// makes to read `model_info()` before it can compose the string; the
+    /// attach construction carries it. A `None`-fingerprint attach is still
+    /// legal (the kernel treats an absent fingerprint as "re-derive every
+    /// sweep"), but the host always composes one.
+    fingerprint: Option<String>,
+}
+
+#[cfg(feature = "engine-remote")]
+impl RemoteDescriber {
+    /// The kernel-facing engine: the pure-compute describe engine carrying the
+    /// host fingerprint via `WithPolicy` (so `Blocking`'s `Recognizer`
+    /// fingerprint reports it). `WithPolicy`'s embed-side knobs (dim/safe_batch)
+    /// are inert for a recognizer — only the fingerprint matters here.
+    pub(crate) fn engine_arc(
+        &self,
+    ) -> Arc<shrike_engine_api::WithPolicy<shrike_describe_remote::RemoteDescriber>> {
+        Arc::new(shrike_engine_api::WithPolicy::new(
+            Arc::clone(&self.engine),
+            self.fingerprint.clone(),
+            None,
+            1,
+        ))
+    }
+}
+
+#[cfg(feature = "engine-remote")]
+#[pymethods]
+impl RemoteDescriber {
+    #[new]
+    #[pyo3(signature = (base_url, *, api_key=None, model=None, fingerprint=None))]
+    fn new(
+        base_url: String,
+        api_key: Option<String>,
+        model: Option<String>,
+        fingerprint: Option<String>,
+    ) -> PyResult<Self> {
+        // Construction validates the API key (header-injection guard) — the
+        // same discipline as RemoteEmbedder.
+        let engine = shrike_describe_remote::RemoteDescriber::new(
+            shrike_describe_remote::RemoteDescriberConfig {
+                base_url,
+                api_key,
+                model,
+                ..Default::default()
+            },
+        )
+        .map_err(crate::to_py_err)?;
+        Ok(Self {
+            engine: Arc::new(engine),
+            fingerprint,
+        })
+    }
+
+    /// The host's fingerprint recipe (the crate's `compose_fingerprint`):
+    /// `describe:<id>[:meta=…][:mmproj=<name>]:prompt=<N>`. Exposed as a
+    /// static method so the host composes the same string the engine identity
+    /// will carry — `model_info()` provides `(id, meta_json)`; `mmproj` is
+    /// folded ONLY for a host-launched local managed server (a cloud endpoint
+    /// passes `None`, byte-identical to "no mmproj suffix").
+    #[staticmethod]
+    #[pyo3(signature = (model_id, meta_json, configured_model=None, mmproj=None))]
+    fn compose_fingerprint(
+        model_id: Option<String>,
+        meta_json: String,
+        configured_model: Option<String>,
+        mmproj: Option<String>,
+    ) -> PyResult<String> {
+        let meta = serde_json::from_str::<serde_json::Value>(&meta_json)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        let info = shrike_describe_remote::ModelInfo { id: model_id, meta };
+        Ok(shrike_describe_remote::compose_fingerprint(
+            &info,
+            configured_model.as_deref(),
+            mmproj.as_deref(),
+        ))
+    }
+
+    /// Blocking direct describe in the RecognizerBackend wire shape
+    /// (`(text, confidence, segments_json)`; describe locates nothing so the
+    /// segments JSON is always `""`) — for tests and direct callers; the
+    /// kernel path never comes through here. A chunk-level failure (a down
+    /// endpoint) raises; a per-item failure degrades to an empty recognition
+    /// (the crate's settled error split).
+    fn recognize(
+        &self,
+        py: Python<'_>,
+        items: Vec<Vec<u8>>,
+    ) -> PyResult<Vec<(String, f64, String)>> {
+        use shrike_engine_api::RecognizeMedia as _;
+        py.detach(|| {
+            let media: Vec<MediaItem> = items.into_iter().map(MediaItem::untyped).collect();
+            let recognitions = self.engine.recognize_chunk(&media)?;
+            Ok(recognitions
+                .into_iter()
+                .map(|r| {
+                    let segments_json = if r.segments.is_empty() {
+                        String::new()
+                    } else {
+                        serde_json::to_string(&r.segments).unwrap_or_default()
+                    };
+                    (r.text, r.confidence, segments_json)
+                })
+                .collect())
+        })
+        .map_err(crate::to_py_err)
+    }
+
+    /// `GET /health` returns 200 — the host's connectivity probe at attach.
+    fn health_ok(&self, py: Python<'_>) -> bool {
+        py.detach(|| self.engine.health_ok())
+    }
+
+    /// `(model_id, meta_json)` from `/v1/models` — `(None, "{}")` when the
+    /// endpoint doesn't serve it; fingerprint assembly stays host policy
+    /// (`compose_fingerprint`).
+    fn model_info(&self, py: Python<'_>) -> (Option<String>, String) {
+        py.detach(|| {
+            let info = self.engine.model_info();
+            let meta = serde_json::Value::Object(info.meta).to_string();
+            (info.id, meta)
+        })
+    }
+}
+
 /// The Python-visible wrapper the harness constructs at assembly:
 /// `Recognizer.capture(backend)`.
 #[pyclass(name = "Recognizer")]
