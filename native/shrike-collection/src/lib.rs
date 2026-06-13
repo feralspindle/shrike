@@ -19,6 +19,7 @@
 
 mod adapter;
 pub mod embed_text;
+mod export;
 mod media;
 mod note_types;
 mod read;
@@ -31,8 +32,8 @@ use shrike_ffi::{NativeError, NativeResult};
 // Canonical homes moved to the store contract (#389); re-exported so the
 // pre-trait import paths keep working.
 pub use shrike_store_api::{
-    Collection, CreateOutcome, DuplicatePolicy, OwnedFieldRow, PreparedMedia, PreparedMediaSource,
-    ServiceNote,
+    Collection, CreateOutcome, DuplicatePolicy, ExportOutcome, ExportRequest, ExportScope,
+    OwnedFieldRow, PackageFormat, PreparedMedia, PreparedMediaSource, ServiceNote,
 };
 
 /// Shrike's collection core, slice-1 vertical. One instance owns one open
@@ -260,7 +261,7 @@ impl CollectionCore {
 #[allow(clippy::use_self)]
 mod contract {
     use super::{CollectionCore, CreateOutcome, DuplicatePolicy, NativeResult};
-    use crate::{OwnedFieldRow, PreparedMedia, ServiceNote};
+    use crate::{ExportOutcome, ExportRequest, OwnedFieldRow, PreparedMedia, ServiceNote};
     use serde_json::Value;
     use shrike_schemas::{
         CollectionCheckResponse, CollectionInfo, CollectionPruneResponse, DeckInput,
@@ -569,6 +570,9 @@ mod contract {
                 unused_media,
                 dry_run,
             )
+        }
+        fn export_package(&self, request: &ExportRequest) -> NativeResult<ExportOutcome> {
+            Self::export_package(self, request)
         }
     }
 }
@@ -1390,6 +1394,139 @@ mod tests {
     }
 
     #[test]
+    fn export_writes_through_a_planted_basename_symlink_safely() {
+        // Shared-host hazard (#71 security): another user plants a symlink at
+        // the export basename pointing OUTSIDE the root. The temp+atomic-rename
+        // write must REPLACE that symlink with the real package, never follow
+        // it (which would redirect the operator-privileged write to the target).
+        let (core, dir) = temp_core();
+        core.create_note(
+            core.notetype_id("Basic").unwrap(),
+            DEFAULT_DECK,
+            &["front".into(), "back".into()],
+            &[],
+            DuplicatePolicy::Error,
+        )
+        .unwrap();
+
+        // The "victim" file the symlink points at — it must stay untouched.
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"do not overwrite me").unwrap();
+        let out = dir.join("export.apkg");
+        std::os::unix::fs::symlink(&victim, &out).unwrap();
+        assert!(std::fs::symlink_metadata(&out)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        core.export_package(&ExportRequest {
+            out_path: out.to_str().unwrap().to_string(),
+            format: PackageFormat::Apkg,
+            scope: ExportScope::Whole,
+            with_scheduling: false,
+            with_media: true,
+            legacy: false,
+        })
+        .unwrap();
+
+        // The victim is intact (the write did NOT follow the symlink)...
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not overwrite me");
+        // ...and the export path is now a REAL file (the symlink was replaced),
+        // a valid non-empty package.
+        assert!(!std::fs::symlink_metadata(&out)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::metadata(&out).unwrap().len() > 0);
+        // No staging temp left behind in the dir.
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".shrike-export-")
+            })
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "export temp not cleaned up: {leftover:?}"
+        );
+
+        core.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn export_does_not_write_through_a_pre_planted_temp_dir_name() {
+        // The #71 review hazard: the package's write target must not be a path
+        // an attacker can pre-create. The export mkdtemp's a securely-random,
+        // EXCLUSIVELY-created subdir in the parent — so even a pre-planted entry
+        // can't be the write target. Verify the package lands at the requested
+        // path (the export succeeded via a server-owned temp dir, not a planted
+        // one), the victim a planted name pointed at is untouched, and no temp
+        // dir lingers.
+        let (core, dir) = temp_core();
+        core.create_note(
+            core.notetype_id("Basic").unwrap(),
+            DEFAULT_DECK,
+            &["front".into(), "back".into()],
+            &[],
+            DuplicatePolicy::Error,
+        )
+        .unwrap();
+
+        // Pre-plant a symlink at a guessable temp-style name (the old scheme's
+        // shape) pointing at a victim; the secure mkdtemp must not reuse it.
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"keep me").unwrap();
+        let planted = dir.join(".shrike-export-pre-planted");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let out = dir.join("export.apkg");
+        core.export_package(&ExportRequest {
+            out_path: out.to_str().unwrap().to_string(),
+            format: PackageFormat::Apkg,
+            scope: ExportScope::Whole,
+            with_scheduling: false,
+            with_media: true,
+            legacy: false,
+        })
+        .unwrap();
+
+        // The package landed at the requested path (a real, non-empty file)...
+        assert!(out.is_file() && std::fs::metadata(&out).unwrap().len() > 0);
+        // ...the victim is untouched (the write never followed any planted
+        // name)...
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        // ...and the planted symlink itself is still a symlink (the export
+        // mkdtemp'd its own dir; it neither reused nor clobbered the plant).
+        assert!(std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        // No server-owned export temp dir lingers (tempfile drops it).
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                // The plant is named ...-pre-planted; a leaked server temp dir
+                // would carry tempfile's random suffix after the prefix.
+                n.starts_with(".shrike-export-") && n != ".shrike-export-pre-planted"
+            })
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "export temp dir not cleaned up: {leftover:?}"
+        );
+
+        core.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn busy_surface_release_reopen() {
         // The #64/#65 contention story: a second holder makes reopen BUSY;
         // releasing hands the lock over; reopening after the holder leaves
@@ -1768,6 +1905,29 @@ mod tests {
         core.media_check().unwrap();
         core.delete_media(&["drive.png".to_string()]).unwrap();
         core.prune(true, true, true, true, false).unwrap();
+
+        // Export (#71): a scoped .apkg (ExportAnkiPackage) and a whole-
+        // collection .colpkg (ExportCollectionPackage) — so both import_export
+        // method constants dispatch. The colpkg consumes+reopens the
+        // collection internally, so it goes last; the apkg leaves it open.
+        core.export_package(&ExportRequest {
+            out_path: dir.join("drive.apkg").to_str().unwrap().to_string(),
+            format: PackageFormat::Apkg,
+            scope: ExportScope::Whole,
+            with_scheduling: false,
+            with_media: true,
+            legacy: false,
+        })
+        .unwrap();
+        core.export_package(&ExportRequest {
+            out_path: dir.join("drive.colpkg").to_str().unwrap().to_string(),
+            format: PackageFormat::Colpkg,
+            scope: ExportScope::Whole,
+            with_scheduling: false,
+            with_media: true,
+            legacy: false,
+        })
+        .unwrap();
 
         core.delete_notes(&[id_a]).unwrap();
         core.close().unwrap();

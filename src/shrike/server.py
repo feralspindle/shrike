@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import contextlib
 import functools
-import ipaddress
 import logging
 import os
 import signal
@@ -42,6 +41,11 @@ from shrike.harness import CollectionManager, Harness, HarnessParams, KernelConf
 # unchanged.
 from shrike.log import configure_logging
 from shrike.paths import cache_dir, state_dir
+from shrike.pathsafety import (
+    is_loopback,
+    server_is_purely_local,
+    validate_path_root,
+)
 from shrike.schemas import WIRE_PROTOCOL_VERSION, ActionError, ActionErrorCode
 from shrike.tools import ToolInputError, register_tools
 
@@ -111,16 +115,6 @@ def _positive_int(raw: str) -> int:
     return value
 
 
-def _is_loopback(host: str) -> bool:
-    """True if *host* names the loopback interface (so binding is browser-safe)."""
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host.strip("[]")).is_loopback
-    except ValueError:
-        return False
-
-
 def _build_transport_security(
     host: str,
     *,
@@ -177,47 +171,14 @@ def _build_transport_security(
     )
 
 
-def _server_is_purely_local(
-    host: str,
-    *,
-    allow_remote: bool,
-    no_dns_rebinding_protection: bool,
-    allowed_hosts: list[str] | None,
-    allowed_origins: list[str] | None,
-) -> bool:
-    """Whether the server is in its default, purely-local configuration (#164).
-
-    Gates the server-local ``path`` input to ``store_media``: only when the bind
-    is loopback, ``--allow-remote`` is off, the DNS-rebinding guard is on, and no
-    extra ``--allowed-host``/``--allowed-origin`` was added. Any of those signals
-    possible remote traffic — and crucially, behind a same-host reverse proxy /
-    tailnet (``--no-dns-rebinding-protection`` or an added allow-list) the loopback
-    peer is the proxy, not the real (remote) client — so server-local file reads
-    must stay disabled there.
-    """
-    return (
-        _is_loopback(host)
-        and not allow_remote
-        and not no_dns_rebinding_protection
-        and not allowed_hosts
-        and not allowed_origins
-    )
-
-
-def _validate_media_path_root(raw: str) -> str:
-    """Canonicalize and validate ``--media-path-root`` at startup (#170), or raise.
-
-    Returns the resolved absolute real path (symlinks collapsed) used for the
-    store_media containment check. Rejects the filesystem root (``dirname(p) == p``
-    is true for ``/``, a Windows drive root, etc. — confining to ``/`` is no
-    confinement) and a root that isn't an existing directory (so it can't 'refuse
-    everything' or spring into existence later)."""
-    resolved = os.path.realpath(os.path.expanduser(raw))
-    if os.path.dirname(resolved) == resolved:
-        raise ValueError(f"refusing the filesystem root '{resolved}' (confines nothing)")
-    if not os.path.isdir(resolved):
-        raise ValueError(f"'{raw}' is not an existing directory")
-    return resolved
+# The server-local path-safety mechanism is shared across capabilities
+# (store_media #164/#170, export #71, import #72) — the generic helpers live in
+# shrike.pathsafety. These module-level aliases keep the historical server.py
+# names that existing call sites and tests import; the per-capability *policy*
+# (which root list, which gate) stays at the call sites.
+_is_loopback = is_loopback
+_server_is_purely_local = server_is_purely_local
+_validate_media_path_root = validate_path_root
 
 
 def create_mcp(
@@ -253,6 +214,7 @@ def _register_custom_routes(
     request_shutdown: Callable[[], None],
     action_tools: dict[str, Tool] | None = None,
     manager: CollectionManager | None = None,
+    export_store: Any | None = None,
 ) -> None:
     """Register custom HTTP endpoints on the server.
 
@@ -385,6 +347,34 @@ def _register_custom_routes(
         if not os.path.isfile(full):
             return Response(status_code=404)
         return FileResponse(full, filename=safe)
+
+    @app.custom_route("/export/{token}", methods=["GET"])
+    @_guard
+    async def handle_export(request: Request) -> Response:
+        # Serve a pending export package by its one-shot token (#71) — the
+        # download path export_package's `url` points at (no base64). Read-only;
+        # same Host/Origin guard. The token is the capability (secrets-random,
+        # unguessable); the file is a server-named temp under the cache dir, so
+        # there is no traversal surface. Reaped after a successful stream — and
+        # on TTL / shutdown by the store regardless.
+        if export_store is None:
+            return Response(status_code=404)
+        token = request.path_params.get("token", "")
+        path = export_store.resolve(token)
+        if path is None:
+            return Response(status_code=404)
+        from starlette.background import BackgroundTask
+
+        filename = os.path.basename(path)
+        # One-shot: reap AFTER the body is streamed (a background task runs once
+        # the response completes — reaping inline would delete the file before
+        # FileResponse reads it). A failed/aborted GET leaves it for the TTL
+        # sweep / shutdown, so the collection-bearing temp never lingers.
+        return FileResponse(
+            path,
+            filename=filename,
+            background=BackgroundTask(export_store.reap, token),
+        )
 
     @app.custom_route("/index/rebuild", methods=["POST"])
     @_guard
@@ -703,6 +693,17 @@ def main() -> None:
         "DIR (after resolving symlinks). Repeatable for several locations; a path under "
         "any one is allowed. Off (path rejected) when unset. Also read from "
         "SHRIKE_MEDIA_PATH_ROOTS (os.pathsep-separated). Requires a purely-local daemon.",
+    )
+    parser.add_argument(
+        "--export-path-root",
+        action="append",
+        default=None,
+        metavar="DIR",
+        help="Enable export_package's server-local `output_path`, confined to files written "
+        "under DIR (after resolving symlinks). Repeatable; a path under any one is allowed. "
+        "Off (output_path rejected; export still works via the download url) when unset. Also "
+        "read from SHRIKE_EXPORT_PATH_ROOTS (os.pathsep-separated). Requires a purely-local "
+        "daemon — a write capability distinct from --media-path-root's read.",
     )
     parser.add_argument(
         "--index-save-delay",
@@ -1055,44 +1056,68 @@ def main() -> None:
     else:
         url_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
         media_base_url = f"http://{url_host}:{args.port}"
-    # store_media's server-local `path` is OFF by default (#170): honored only
-    # when the operator opts in with one or more --media-path-root, AND the server
-    # is purely local, AND the path is contained in one of those roots. The two
-    # gates compose — purely-local stops a remote/proxied caller from *reaching*
-    # it; the roots bound *what* a permitted caller can read. Roots set on a
-    # non-purely-local server are refused (warn) rather than silently half-enabled.
-    raw_roots = list(args.media_path_root or [])
-    env_roots = os.environ.get("SHRIKE_MEDIA_PATH_ROOTS")
-    if env_roots:
-        raw_roots += [p for p in env_roots.split(os.pathsep) if p]
-    server_path_roots: list[str] = []
-    if raw_roots:
-        # Validate + canonicalize **per element** (dedup, order-preserving): the
-        # containment disjunction means the weakest root governs, so a single bad
-        # one (filesystem root, missing dir) must fail startup, not pass silently.
+    # Whether the server is in its default purely-local config — the shared
+    # outer gate on every server-local filesystem capability (store_media's
+    # `path` read, export's `output_path` write). Computed once; both gates
+    # below compose it with their own root list.
+    purely_local = _server_is_purely_local(
+        args.host,
+        allow_remote=args.allow_remote,
+        no_dns_rebinding_protection=args.no_dns_rebinding_protection,
+        allowed_hosts=args.allowed_host,
+        allowed_origins=args.allowed_origin,
+    )
+
+    def _resolve_path_roots(
+        flag_value: list[str] | None, env_name: str, flag_label: str, capability: str
+    ) -> list[str]:
+        """Validate + canonicalize an operator-allowed root list (#71): per
+        element (dedup, order-preserving) — the containment disjunction means
+        the weakest root governs, so one bad root (filesystem root, missing dir)
+        fails startup, not passes silently. Honored only on a purely-local
+        server; a root set on a non-purely-local one is refused (warn), never
+        half-enabled. Returns the active roots (empty → the capability stays
+        off)."""
+        raw = list(flag_value or [])
+        env = os.environ.get(env_name)
+        if env:
+            raw += [p for p in env.split(os.pathsep) if p]
+        if not raw:
+            return []
         validated: list[str] = []
-        for r in raw_roots:
+        for r in raw:
             try:
-                resolved = _validate_media_path_root(r)
+                resolved = validate_path_root(r)
             except ValueError as e:
-                logger.error("Invalid --media-path-root %r: %s", r, e)
+                logger.error("Invalid %s %r: %s", flag_label, r, e)
                 sys.exit(1)
             if resolved not in validated:
                 validated.append(resolved)
-        if _server_is_purely_local(
-            args.host,
-            allow_remote=args.allow_remote,
-            no_dns_rebinding_protection=args.no_dns_rebinding_protection,
-            allowed_hosts=args.allowed_host,
-            allowed_origins=args.allowed_origin,
-        ):
-            server_path_roots = validated
-            logger.info("store_media server-local paths enabled, confined to %s", validated)
-        else:
+        if not purely_local:
             logger.warning(
-                "--media-path-root is set but the server is not purely-local "
-                "(remote/proxied exposure); store_media server-local paths stay disabled"
+                "%s is set but the server is not purely-local (remote/proxied "
+                "exposure); %s stays disabled",
+                flag_label,
+                capability,
             )
+            return []
+        logger.info("%s enabled, confined to %s", capability, validated)
+        return validated
+
+    # store_media's server-local `path` read (#170) and export's `output_path`
+    # write (#71): distinct capabilities, distinct root lists, the same gate.
+    server_path_roots = _resolve_path_roots(
+        args.media_path_root,
+        "SHRIKE_MEDIA_PATH_ROOTS",
+        "--media-path-root",
+        "store_media server-local paths",
+    )
+    export_path_roots = _resolve_path_roots(
+        args.export_path_root,
+        "SHRIKE_EXPORT_PATH_ROOTS",
+        "--export-path-root",
+        "export server-local output paths",
+    )
 
     # The collection/profile registry (#66): a read-only snapshot for the
     # `list_profiles` enumeration action. Loaded from the server's config file
@@ -1109,6 +1134,14 @@ def main() -> None:
         profile_registry = Registry.from_config(load_config(registry_config_path))
     except Exception:  # noqa: BLE001 — enumeration is a convenience, never gates boot
         logger.debug("profile registry unavailable; list_profiles will report empty")
+
+    # The export download store (#71): server-named temp packages under the
+    # cache dir + their one-shot download tokens, reaped on download / TTL /
+    # shutdown. Backs the default export delivery (the GET /export/{token}
+    # route below); the server-local output_path mode bypasses it.
+    from shrike.export_store import ExportStore
+
+    export_store = ExportStore(str(cache_base))
 
     async def _serve() -> None:
         # Assembly runs ON the loop (#332 S3d-2): the kernel opens with a
@@ -1182,6 +1215,8 @@ def main() -> None:
                     h.derived.close()
             with contextlib.suppress(Exception):
                 harness.runtime.stop()
+            with contextlib.suppress(Exception):
+                export_store.close()  # reap any pending download temps (#71)
             server_lock.release()
             logger.info("Shutdown complete")
             sys.exit(0)
@@ -1201,6 +1236,9 @@ def main() -> None:
             allow_private_fetch=allow_private_media_fetch,
             server_path_roots=server_path_roots,
             media_base_url=media_base_url,
+            export_path_roots=export_path_roots,
+            export_store=export_store,
+            server_purely_local=purely_local,
             registry=profile_registry,
             # Per-call collection routing (#68 S2): the manager resolves a
             # selector to the right collection's bundle, lazily assembling it.
@@ -1223,6 +1261,7 @@ def main() -> None:
             request_shutdown=_request_shutdown,
             action_tools=action_tools,
             manager=manager,
+            export_store=export_store,
         )
 
         logger.info(
@@ -1257,6 +1296,8 @@ def main() -> None:
             # Close every routed collection too (#68), default last (it stops
             # the shared embedding runtime after the routed ones detach).
             await manager.close()
+        with contextlib.suppress(Exception):
+            export_store.close()  # reap any pending download temps (#71)
         server_lock.release()
         logger.info("Shutdown complete")
 

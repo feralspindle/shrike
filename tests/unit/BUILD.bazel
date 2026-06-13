@@ -91,6 +91,8 @@ _INDEX = ["test_index_policy.py"]
 
 _CACHE_LAYOUT = ["test_cache_layout.py"]
 
+_PATHSAFETY = ["test_pathsafety.py"]
+
 _DERIVED = [
     "test_derived.py",
     "test_derived_native.py",
@@ -126,6 +128,7 @@ _TOOLS = [
     "test_tool_logging.py",
     "test_tools_busy.py",
     "test_tools_decks.py",
+    "test_tools_export.py",
     "test_tools_field_metadata.py",
     "test_tools_find_replace.py",
     "test_tools_find_replace_models.py",
@@ -155,6 +158,7 @@ _CLI = [
     "test_cli_collection_prune.py",
     "test_cli_collection_query.py",
     "test_cli_deck.py",
+    "test_cli_export.py",
     "test_cli_index_embedding.py",
     "test_cli_json_output.py",
     "test_cli_migrate_type.py",
@@ -226,6 +230,16 @@ pytest_test(
 )
 
 pytest_test(
+    name = "pathsafety",
+    srcs = _PATHSAFETY,
+    xdist = None,
+    deps = [
+        ":conftest",
+        "//src/shrike:pathsafety",
+    ],
+)
+
+pytest_test(
     name = "derived",
     srcs = _DERIVED,
     xdist = None,
@@ -274,6 +288,7 @@ pytest_test(
     srcs = _TOOLS,
     deps = [
         ":conftest",
+        "//src/shrike:export_store",  # test_tools_export builds an ExportStore (#71)
         "//src/shrike:harness",
         "//src/shrike:index",
         "//src/shrike:recognition",
@@ -316,7 +331,8 @@ pytest_test(
 # Analysis-time completeness guard: every test_*.py must be named in exactly
 # one cluster (or _PIP_ONLY). A forgotten file fails the build loudly here
 # instead of silently never running under Bazel.
-_ASSIGNED = _PIP_ONLY + _CORE + _CLIENT + _DAEMON + _LOG + _INDEX + _CACHE_LAYOUT + _DERIVED + \
+_ASSIGNED = _PIP_ONLY + _CORE + _CLIENT + _DAEMON + _LOG + _INDEX + _CACHE_LAYOUT + \
+            _PATHSAFETY + _DERIVED + \
             _EMBED_HELPERS + _EMBEDDING + _ACTIONS + _TOOLS + \
             _SERVER + _CONFIG + _CLI
 
