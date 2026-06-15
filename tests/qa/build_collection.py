@@ -2,9 +2,9 @@
 """Build the QA fixture collection from a declarative JSON corpus.
 
 Reads ``collection.json`` (decks, note types, notes + tags) and writes a fresh
-``collection.anki2`` by routing every note through Shrike's own
-``CollectionWrapper._upsert_notes`` — the same write path the server uses — so
-the fixture is built exactly the way real notes are.
+``collection.anki2`` by routing every note through the native core's
+``upsert_notes`` — the same write path the server uses — so the fixture is built
+exactly the way real notes are.
 
 The corpus is the checked-in source of truth; the built collection is a
 disposable, gitignored artifact regenerated on every QA launch. There is no
@@ -47,7 +47,11 @@ def build(spec_path: Path, out_path: Path) -> int:
 
     wrapper = CollectionWrapper(str(out_path))
     try:
-        results = wrapper.run_sync(lambda _col: wrapper._upsert_notes(notes))
+        # The same write path the server uses: the native core's upsert_notes,
+        # which resolves decks/note types and returns the per-item result JSON.
+        results = wrapper.run_sync(
+            lambda core: json.loads(core.upsert_notes(json.dumps(notes), "error", False))
+        )
     finally:
         wrapper.close()
 
