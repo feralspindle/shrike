@@ -81,6 +81,72 @@ CLIP_MODEL_FILES = {
     "preprocessor_config.json": f"{_CLIP_BASE}/preprocessor_config.json",
 }
 
+# -- Wave-2 offline-integration profile models (#667, epic #565) --------------
+#
+# These back the pure-ONNX multi-space profile (scripts/profiles/onnx-multispace.yml:
+# embeddinggemma + MobileCLIP2), plus jina-clip-v2 pre-staged for #673 (native
+# fused-graph ClipBackend support; not consumed by any current profile). They are
+# NOT used by any CI test (the per-PR lane never downloads multi-GB models); they
+# exist so //scripts:serve can
+# materialize them by dir-name (Bazel runfiles under `bazel run`, this fetch source
+# off Bazel). Each is sha-pinned (the sha256s are the HuggingFace LFS oids, or the
+# byte sha256 for a git-stored file) and warm-cache restorable like the other
+# model_* externals. Bump the URLs + dir name + sha together to change one.
+
+# EmbeddingGemma-300m ONNX (text-only, 768-dim, mean pooling, 2048 ctx) — the text
+# leg of the onnx-multispace profile. The export ships ONLY quantized graphs (no
+# plain model.onnx), each as a tiny graph stub PLUS an external weight-data file:
+# OnnxBackend's variant-suffix resolver finds model_quantized.onnx, and onnxruntime
+# loads the co-located model_quantized.onnx_data transparently (the external-data
+# landmine — BOTH files must materialize). int8 dynamic-quant, so the batch-safety
+# probe embeds it serially. ~309 MB weights + 20 MB tokenizer. Apache-2.0 base
+# (Gemma terms); ONNX export by onnx-community. The .onnx_data filename MUST stay
+# `model_quantized.onnx_data` (the graph references it by that exact relative name).
+EMBEDDINGGEMMA_MODEL_DIR_NAME = "embeddinggemma-300m-onnx-int8"
+_EMBEDDINGGEMMA_BASE = "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/main"
+EMBEDDINGGEMMA_MODEL_FILES = {
+    "model_quantized.onnx": f"{_EMBEDDINGGEMMA_BASE}/onnx/model_quantized.onnx",
+    "model_quantized.onnx_data": f"{_EMBEDDINGGEMMA_BASE}/onnx/model_quantized.onnx_data",
+    "tokenizer.json": f"{_EMBEDDINGGEMMA_BASE}/tokenizer.json",
+}
+
+# MobileCLIP2-S2 ONNX (text+image, 512-dim shared space) — the image leg of the
+# onnx-multispace profile. Spike #568 verified plhery/mobileclip2-onnx rev ba95759a
+# loads through ClipBackend AS-IS (flat text_model.onnx + vision_model.onnx +
+# preprocessor_config.json per size subdir, a repo-root tokenizer.json) for BOTH S0
+# and S2. S2 is the better default for dogfooding: same 254 MB text encoder, a
+# larger/better 143 MB vision encoder (vs S0's 45 MB) — +98 MB buys cleaner
+# cross-modal separation (the spike's grid: cat↔cat +0.2932 S2 vs +0.2657 S0). fp32
+# graphs (batch-cleared). Apple Sample Code License (apple-amlr) on the base weights.
+# Pinned to the spike's exact revision so the bytes never drift. The preprocessor +
+# repo-root tokenizer are shared across sizes (byte-identical to S0).
+MOBILECLIP2_MODEL_DIR_NAME = "mobileclip2-s2-onnx"
+_MOBILECLIP2_REV = "ba95759a5bdbaca53e9111e2550a76ec09c8fd9e"
+_MOBILECLIP2_BASE = f"https://huggingface.co/plhery/mobileclip2-onnx/resolve/{_MOBILECLIP2_REV}"
+MOBILECLIP2_MODEL_FILES = {
+    "text_model.onnx": f"{_MOBILECLIP2_BASE}/onnx/s2/text_model.onnx",
+    "vision_model.onnx": f"{_MOBILECLIP2_BASE}/onnx/s2/vision_model.onnx",
+    "preprocessor_config.json": f"{_MOBILECLIP2_BASE}/onnx/s2/preprocessor_config.json",
+    "tokenizer.json": f"{_MOBILECLIP2_BASE}/tokenizer.json",
+}
+
+# jina-clip-v2 ONNX (text+image) — pre-staged for #673 (native fused-graph
+# ClipBackend support). NOTE: the canonical jinaai/jina-clip-v2 ONNX export is a
+# SINGLE FUSED model.onnx that takes text AND image inputs on every call — it does
+# NOT ship the separate text_model.onnx + vision_model.onnx graphs ClipBackend
+# requires, so it is NOT a drop-in for the dual-encoder contract as-published.
+# #673 is the deferred native work to drive that fused graph, and it will consume
+# exactly this export. It is NOT consumed by any current profile — jina-text-clip
+# uses MobileCLIP2 for its image leg. The dir/files below pin the combined int8
+# export + the root tokenizer/preprocessor. ~874 MB int8. Apache-2.0/CC.
+JINA_CLIP_V2_MODEL_DIR_NAME = "jina-clip-v2-onnx-int8"
+_JINA_CLIP_V2_BASE = "https://huggingface.co/jinaai/jina-clip-v2/resolve/main"
+JINA_CLIP_V2_MODEL_FILES = {
+    "model_quantized.onnx": f"{_JINA_CLIP_V2_BASE}/onnx/model_quantized.onnx",
+    "tokenizer.json": f"{_JINA_CLIP_V2_BASE}/tokenizer.json",
+    "preprocessor_config.json": f"{_JINA_CLIP_V2_BASE}/preprocessor_config.json",
+}
+
 # The small multimodal embedding model for the manual #501 image-embed harness
 # (test_multimodal.py): jina-embeddings-v5-omni nano — a text GGUF + a vision
 # mmproj that embed text AND images into one 768-dim space. ~625 MB (431 MB
@@ -214,6 +280,36 @@ def cached_onnx_fp32_model_dir(fallback_dir: Path) -> Path:
 def cached_clip_model_dir(fallback_dir: Path) -> Path:
     """The pinned small CLIP dir (int8 text+vision graphs, 512-dim shared space)."""
     return _cached_model_dir(fallback_dir, CLIP_MODEL_DIR_NAME, CLIP_MODEL_FILES)
+
+
+def cached_embeddinggemma_model_dir(fallback_dir: Path) -> Path:
+    """The embeddinggemma-300m int8 ONNX dir (768-dim text, external weight data).
+
+    Fetches BOTH model_quantized.onnx and its model_quantized.onnx_data companion
+    (the external-data landmine) plus tokenizer.json. ~329 MB; only fetched when
+    //scripts:serve materializes the onnx-multispace profile off Bazel, or when
+    called directly to pre-seed the shared cache."""
+    return _cached_model_dir(
+        fallback_dir, EMBEDDINGGEMMA_MODEL_DIR_NAME, EMBEDDINGGEMMA_MODEL_FILES
+    )
+
+
+def cached_mobileclip2_model_dir(fallback_dir: Path) -> Path:
+    """The MobileCLIP2-S2 ONNX dir (text+image, 512-dim shared space; ClipBackend).
+
+    Flat text_model.onnx + vision_model.onnx + preprocessor_config.json + tokenizer.json
+    (the layout spike #568 verified loads through ClipBackend as-is). ~399 MB."""
+    return _cached_model_dir(fallback_dir, MOBILECLIP2_MODEL_DIR_NAME, MOBILECLIP2_MODEL_FILES)
+
+
+def cached_jina_clip_v2_model_dir(fallback_dir: Path) -> Path:
+    """The jina-clip-v2 int8 ONNX dir (combined model.onnx + tokenizer + preprocessor).
+
+    Pre-staged for #673 (native fused-graph ClipBackend support); not consumed by
+    any current profile. NOTE the combined-graph caveat in the module-level
+    declaration: the published export is NOT a ClipBackend drop-in (single fused
+    graph, not split text/vision). ~874 MB."""
+    return _cached_model_dir(fallback_dir, JINA_CLIP_V2_MODEL_DIR_NAME, JINA_CLIP_V2_MODEL_FILES)
 
 
 def cached_multimodal_model_dir(fallback_dir: Path) -> Path:
