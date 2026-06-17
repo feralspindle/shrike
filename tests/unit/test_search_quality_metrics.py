@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tests.search_quality.manifest import load_manifest
-from tests.search_quality.metrics import (
+from tests.manual.search_quality.manifest import load_manifest
+from tests.manual.search_quality.metrics import (
     RRF_WEIGHTS,
     GradedGold,
     RankedCard,
@@ -24,7 +24,11 @@ from tests.search_quality.metrics import (
 )
 
 FIXTURE = (
-    Path(__file__).resolve().parents[1] / "search_quality" / "fixtures" / "example_manifest.json"
+    Path(__file__).resolve().parents[1]
+    / "manual"
+    / "search_quality"
+    / "fixtures"
+    / "example_manifest.json"
 )
 
 
@@ -135,7 +139,7 @@ class TestSuiteAggregate:
         suite = SuiteReport(queries=(ok, miss))
         assert suite.passed is False
         assert suite.mean_recall_at_k() == 0.5  # one hit, one miss
-        from tests.search_quality.metrics import FailureKind
+        from tests.manual.search_quality.metrics import FailureKind
 
         rolled = suite.failures_by_kind()
         # the missed query records a RECALL_MISS for gold note 10
