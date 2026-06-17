@@ -1,0 +1,26 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//shrike-core:__subpackages__"])
+
+exports_files(["Cargo.toml"])
+
+# The shared error taxonomy crate (#705): the NativeError type every native
+# crate returns across the FFI seam. NO pyo3 here (enforced by
+# //shrike-core:layering_check) — the Python exception mapping lives in shrike-py.
+rust_library(
+    name = "shrike_error",
+    srcs = ["src/lib.rs"],
+    edition = "2021",
+    deps = [
+        "@crates//:serde_json",
+        "@crates//:thiserror",
+        "@crates//:tracing",
+        "@crates//:tracing-error",
+    ],
+)
+
+rust_test(
+    name = "shrike_error_test",
+    size = "small",
+    crate = ":shrike_error",
+)

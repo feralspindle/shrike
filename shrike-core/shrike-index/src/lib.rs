@@ -8,7 +8,7 @@
 
 mod engine;
 
-use shrike_ffi::{NativeError, NativeResult};
+use shrike_error::{ErrorKind, NativeResult, ResultExt};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 pub use engine::{ActivationStats, ModalityRanking, MultiModalIndex};
@@ -23,11 +23,10 @@ pub fn new_index(ndim: usize) -> NativeResult<Index> {
         multi: true,
         ..Default::default()
     };
-    let index =
-        Index::new(&options).map_err(|e| NativeError::internal(format!("usearch new: {e}")))?;
+    let index = Index::new(&options).context(ErrorKind::Internal, "usearch new")?;
     index
         .reserve(64)
-        .map_err(|e| NativeError::internal(format!("usearch reserve: {e}")))?;
+        .context(ErrorKind::Internal, "usearch reserve")?;
     Ok(index)
 }
 

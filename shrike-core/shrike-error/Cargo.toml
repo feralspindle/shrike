@@ -1,0 +1,39 @@
+[package]
+name = "shrike-error"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "The shared error taxonomy every Shrike native crate returns across the FFI seam (#269, #705)."
+
+[lib]
+name = "shrike_error"
+
+# Pure Rust by design — NO pyo3 here (epic #265 convention 5). The Python
+# exception mapping for this crate's error taxonomy lives in shrike-py, the one
+# crate allowed to see pyo3.
+#
+# tracing (#308): native code emits spans/events with NO subscriber installed —
+# the harness injects the sink. tracing-error captures span traces into
+# NativeError so failures carry context out through the FFI.
+#
+# This is a layer-floor crate every native crate depends on, INCLUDING the
+# kernel. The only leaf-error `From` impls here are the lightweight, ubiquitous
+# ones (`serde_json`, `io`) — pulling those into the floor crate costs nothing.
+#
+# The HEAVY/ENGINE leaves (ort, rusqlite, ureq) are deliberately NOT given a
+# `From` here, even feature-gated: under Cargo workspace feature unification a
+# single shared `shrike-error` instance is built for the whole graph, so turning
+# on a `from-ort` feature on ANY crate (shrike-embed) activates shrike-error's
+# optional `ort` dep for the whole graph — `cargo tree -i ort` then shows
+# shrike-error -> shrike-collection -> shrike-kernel, i.e. the kernel gains ort,
+# the exact bloat the firewall must prevent (verified empirically, #705). Instead
+# a using crate attaches its leaf as the recoverable `#[source]` via
+# `ResultExt::context` / `NativeError::with_source` (boxed through `Into<BoxError>`
+# — needs no leaf dep in this crate). VERIFY: `cargo tree -i ort -p shrike-kernel`
+# matches none, and `cargo tree -i ort` does not route through shrike-error.
+[dependencies]
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-error = "0.2"
