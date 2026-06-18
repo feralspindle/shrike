@@ -1,0 +1,34 @@
+# Generic image preprocessing for the CLIP pixel pipeline (#707, epic #703).
+#
+# A LEAF utility crate: byte -> decode -> resize-shortest-edge -> center-crop ->
+# rescale/normalize -> CHW f32. NO engine/kernel/Shrike-domain logic —
+# `shrike-embed`'s CLIP engine is its only consumer (enforced by
+# //shrike-core:layering_check, LAYER_FLOOR). The only Shrike coupling is the
+# shared error taxonomy (shrike-error, itself a floor crate), so call sites keep
+# the `NativeResult` they already used.
+[package]
+name = "shrike-image"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[features]
+# `accel` (default): the autovectorizable contiguous-plane normalize/CHW path.
+# It is the *same* affine math as the scalar reference (per-channel FMA), so it
+# matches within the golden image-prep tolerance — no IMAGE_PREP_VERSION_RS bump.
+# Off => a plain scalar normalize loop (minimal-core, no autovectorization hint).
+default = ["accel"]
+accel = []
+
+[dependencies]
+shrike-error = { workspace = true }
+# Decode, the scalar Catmull-Rom resize, and center-crop. The format feature set
+# mirrors `shrike-embed`'s prior `image` dep exactly so decode behaviour is
+# unchanged by the move (#707).
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+] }
