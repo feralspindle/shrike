@@ -424,11 +424,7 @@ impl CollectionCore {
                 .into_iter()
                 .enumerate()
                 .map(|(i, item)| {
-                    shrike_kernel::media_fetch::prepare_media_item(
-                        i as i64,
-                        item,
-                        allow_private_fetch,
-                    )
+                    shrike_media::prepare_media_item(i as i64, item, allow_private_fetch)
                 })
                 .collect();
             self.inner
@@ -444,7 +440,7 @@ impl CollectionCore {
         let addr: std::net::IpAddr = ip
             .parse()
             .map_err(|e| crate::NativeInputError::new_err(format!("bad ip: {e}")))?;
-        Ok(shrike_kernel::media_fetch::ip_is_allowed(addr))
+        Ok(shrike_media::ip_is_allowed(addr))
     }
 
     // ── note types (#278 step 4) ─────────────────────────────────────────────
