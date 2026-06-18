@@ -24,10 +24,10 @@ This README covers running Shrike yourself: install the package, point it at you
 Install Shrike from PyPI:
 
 ```bash
-pipx install shrike-mcp   # or: pip install shrike-mcp
+pipx install shrike-py   # or: pip install shrike-py
 ```
 
-The package is `shrike-mcp`; the command it installs is `shrike`.
+The package is `shrike-py`; the command it installs is `shrike`. (It was published as `shrike-mcp` before; a final `shrike-mcp` release that depends on `shrike-py` is published once so an existing `pip install shrike-mcp` keeps working and pulls the renamed package — but it is frozen, so switch your install to `shrike-py`.)
 
 Point Shrike at your collection and start the daemon:
 

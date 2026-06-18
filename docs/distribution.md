@@ -117,7 +117,7 @@ inexpressible); the README's "choosing a backend" chapter.
 
 ### 1. DIY home server
 
-Source checkout, the platform-tagged `shrike-mcp` wheel (#497 — the published
+Source checkout, the platform-tagged `shrike-py` wheel (#497 — the published
 pure-Python wheel currently cannot run; that fix leads the milestone), or
 Docker/brew layered over the same wheel. The `server` kernel build. BYOM:
 runtimes `onnx` (in-process, CPU/GPU — the Raspberry Pi case) and `remote`
@@ -202,3 +202,69 @@ of this).
 (recognizer map) and #391's long tail are prerequisites where noted. Q-C's
 web-stack conversation resolved into #506; the desktop default model stays
 an eval (#237), deliberately outside this plan.
+
+## The `shrike-mcp` → `shrike-py` rename (#732)
+
+The published distribution is **`shrike-py`** (it is a CLI + server + daemon, not
+just an MCP server). The import name `shrike` and the `shrike` command are
+unchanged — only the install name moved (`pip install shrike-py`).
+
+### Retiring `shrike-mcp` (one-time, by hand)
+
+The old `shrike-mcp` name is retired with a single frozen release that just
+depends on `shrike-py`, so the PyPI name isn't left dangling and a stray
+`pip install shrike-mcp` still resolves to the renamed package. This is **not** in
+the repo or release.yml — it is a one-time manual step the maintainer runs once,
+when wiring PyPI for the rename. In a throwaway directory:
+
+```bash
+mkdir /tmp/shrike-mcp-final && cd /tmp/shrike-mcp-final
+cat > pyproject.toml <<TOML
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shrike-mcp"
+version = "X.Y.Z"                       # the rename release's version
+description = "Deprecated alias for shrike-py (the distribution was renamed)"
+requires-python = ">=3.12"
+dependencies = ["shrike-py>=X.Y.Z"]     # pull the renamed package; >= never strands users
+
+[tool.hatch.build.targets.wheel]
+bypass-selection = true                 # metadata-only: no code module to ship
+TOML
+python -m build          # produces shrike_mcp-X.Y.Z metadata-only wheel + sdist
+twine upload dist/*       # to the shrike-mcp PyPI project (needs its own upload creds)
+```
+
+After this upload `shrike-mcp` is frozen — never republished. The repo and
+release.yml only ever build/publish `shrike-py`.
+
+**Optional — a deprecation warning on `import shrike_mcp`.** The metadata-only
+form above is enough (the `shrike-py` dependency is the whole migration mechanism).
+If you also want a runtime nudge for anyone who reflexively `import shrike_mcp`s,
+drop `bypass-selection` and ship one tiny module instead:
+
+```bash
+# (same pyproject as above, but replace the [tool.hatch.build.targets.wheel] block with:)
+#   [tool.hatch.build.targets.wheel]
+#   packages = ["shrike_mcp"]
+mkdir shrike_mcp
+cat > shrike_mcp/__init__.py <<'PY'
+import warnings
+warnings.warn(
+    "shrike-mcp has been renamed to shrike-py. Install shrike-py and import shrike.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+PY
+python -m build && twine upload dist/*
+```
+
+### PyPI trusted publishing (maintainer step)
+
+Before the next release tag, configure a PyPI **trusted publisher for `shrike-py`**
+pointing at this repo, `.github/workflows/release.yml`, and the `pypi`
+environment. The rename PR cannot configure PyPI. (The one-time `shrike-mcp`
+upload above is a manual `twine upload`, so it needs no CI trusted publisher.)
