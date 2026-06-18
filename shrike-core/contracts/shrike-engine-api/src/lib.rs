@@ -443,6 +443,86 @@ impl<E: RecognizeMedia> RecognizeMedia for WithPolicy<E> {
     }
 }
 
+/// Host-assembled identity + batch policy over a route-2 ASYNC engine (#721).
+/// The async sibling of [`WithPolicy`]: the host injects the fingerprint/dim the
+/// engine can't know (text-prep versions, the describe prompt version, a probed
+/// dim) AND the proven-safe text batch size — exactly the three knobs sync
+/// `WithPolicy` carries, minus the [`Blocking`] adapter that consumed them. A
+/// route-2 engine does its own IO; this wrapper owns the same text-chunking the
+/// `Blocking` adapter did (one engine `embed` call per `batch_size` chunk, in
+/// order), so the host's probed batch governs request size on the async path
+/// too. `recognize`/`embed_images` delegate unchanged (recognition has no batch
+/// knob; image embeds chunk per-item inside the engine, #501). Wrap the engine
+/// and hand the result straight to the kernel slot — no adapter in between.
+pub struct AsyncWithPolicy<E> {
+    engine: Arc<E>,
+    fingerprint: Option<String>,
+    dim: Option<usize>,
+    batch_size: usize,
+}
+
+impl<E> AsyncWithPolicy<E> {
+    /// Wrap `engine` with its host-assembled policy (fingerprint, dim, proven
+    /// safe text batch — floored at 1). `batch_size` chunks the text path
+    /// exactly as [`WithPolicy`]'s `safe_batch` did under [`Blocking`].
+    pub fn new(
+        engine: Arc<E>,
+        fingerprint: Option<String>,
+        dim: Option<usize>,
+        batch_size: usize,
+    ) -> Self {
+        Self {
+            engine,
+            fingerprint,
+            dim,
+            batch_size: batch_size.max(1),
+        }
+    }
+}
+
+impl<E: Embedder> Embedder for AsyncWithPolicy<E> {
+    fn embed(&self, texts: Vec<String>) -> BoxFuture<'_, NativeResult<Vec<Vec<f32>>>> {
+        let chunk = self.batch_size;
+        Box::pin(async move {
+            if texts.len() <= chunk {
+                return self.engine.embed(texts).await;
+            }
+            let mut out = Vec::with_capacity(texts.len());
+            // Owned chunks so each engine future is independent of `texts`.
+            let mut iter = texts.into_iter().peekable();
+            while iter.peek().is_some() {
+                let piece: Vec<String> = iter.by_ref().take(chunk).collect();
+                out.extend(self.engine.embed(piece).await?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn fingerprint(&self) -> Option<String> {
+        self.fingerprint.clone()
+    }
+
+    fn dim(&self) -> Option<usize> {
+        self.dim.or_else(|| self.engine.dim())
+    }
+}
+
+impl<E: ImageEmbedder> ImageEmbedder for AsyncWithPolicy<E> {
+    fn embed_images(&self, images: Vec<MediaItem>) -> BoxFuture<'_, NativeResult<Vec<Vec<f32>>>> {
+        self.engine.embed_images(images)
+    }
+}
+
+impl<E: Recognizer> Recognizer for AsyncWithPolicy<E> {
+    fn recognize(&self, items: Vec<MediaItem>) -> BoxFuture<'_, NativeResult<Vec<Recognition>>> {
+        self.engine.recognize(items)
+    }
+
+    fn fingerprint(&self) -> Option<String> {
+        self.fingerprint.clone()
+    }
+}
+
 // ── the adapter: sync compute onto the owned runtime (#374 C) ───────────────
 
 /// Route-1 engines become kernel-facing async engines here: each call moves
@@ -707,6 +787,82 @@ mod tests {
         assert_eq!(*toy.calls.lock().unwrap(), vec![2, 1]);
         // safe_batch is floored at 1 (a zero would loop forever).
         assert_eq!(WithPolicy::new(toy, None, None, 0).safe_batch(), 1);
+    }
+
+    /// A route-2 async engine: it owns its own IO (here trivial) and returns a
+    /// future directly, the `RemoteEmbedder` shape `AsyncWithPolicy` wraps. It
+    /// records each `embed` call's batch size so the wrapper's chunking is
+    /// observable.
+    #[derive(Default)]
+    struct AsyncToy {
+        calls: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl Embedder for AsyncToy {
+        fn embed(&self, texts: Vec<String>) -> BoxFuture<'_, NativeResult<Vec<Vec<f32>>>> {
+            self.calls.lock().unwrap().push(texts.len());
+            Box::pin(async move { Ok(texts.iter().map(|t| vec![t.len() as f32]).collect()) })
+        }
+
+        fn fingerprint(&self) -> Option<String> {
+            Some("async-toy:engine".into())
+        }
+
+        fn dim(&self) -> Option<usize> {
+            Some(7)
+        }
+    }
+
+    /// `AsyncWithPolicy` overrides the host-injected identity (fingerprint/dim),
+    /// chunks the text path by the host `batch_size`, and falls back to the
+    /// engine's own dim when the host pins none — the async sibling of
+    /// `with_policy_overrides_identity_and_batch` (#721).
+    #[test]
+    fn async_with_policy_overrides_identity_and_chunks_by_batch() {
+        let toy = Arc::new(AsyncToy::default());
+        let tuned = AsyncWithPolicy::new(
+            Arc::clone(&toy),
+            Some("host:fp:textprep=3".into()),
+            Some(384),
+            2,
+        );
+        // The host policy wins over the engine's own answers.
+        assert_eq!(tuned.fingerprint().as_deref(), Some("host:fp:textprep=3"));
+        assert_eq!(tuned.dim(), Some(384));
+        // embed chunks by batch_size (2): 5 inputs → 2,2,1 — order preserved.
+        let rt = test_runtime();
+        let _guard = rt.enter();
+        let texts: Vec<String> = ["a", "bb", "ccc", "dddd", "eeeee"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let out = rt.block_on(tuned.embed(texts)).unwrap();
+        assert_eq!(
+            out,
+            vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![5.0]],
+            "order mirrors input across chunks"
+        );
+        assert_eq!(
+            *toy.calls.lock().unwrap(),
+            vec![2, 2, 1],
+            "split by batch_size"
+        );
+
+        // dim falls back to the engine's when the host pins none; batch_size 0
+        // floors to 1 (no zero-length chunk loop).
+        let bare = AsyncWithPolicy::new(Arc::new(AsyncToy::default()), None, None, 0);
+        assert_eq!(bare.dim(), Some(7));
+        assert_eq!(bare.fingerprint(), None);
+        let single = Arc::new(AsyncToy::default());
+        let one = AsyncWithPolicy::new(Arc::clone(&single), None, None, 0);
+        let _ = rt
+            .block_on(one.embed(vec!["a".into(), "bb".into()]))
+            .unwrap();
+        assert_eq!(
+            *single.calls.lock().unwrap(),
+            vec![1, 1],
+            "batch_size 0 → serial"
+        );
     }
 
     #[test]
