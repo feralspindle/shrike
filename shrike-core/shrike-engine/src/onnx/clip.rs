@@ -19,7 +19,8 @@ use shrike_error::{ErrorKind, NativeError, NativeResult, ResultExt};
 use shrike_image::PreprocessConfig;
 use tokenizers::Tokenizer;
 
-use crate::{l2_normalize_rows, GraphInput};
+use super::session::GraphInput;
+use super::session::{build_session, extract_2d, graph_inputs, int_tensor, l2_normalize_rows};
 
 /// The pixel-math version of the CLIP preprocessing pipeline, re-exported from
 /// `shrike-image` (its owner since #707) so the facade's fingerprint and the
@@ -44,7 +45,7 @@ pub struct ClipEmbedderConfig {
 
 pub struct ClipEmbedder {
     // Locked because ort 2.0.0-rc.12's run entrypoints all take `&mut self`
-    // (see the note on `TextEmbedder::session`).
+    // (see the note on `super::text::TextEmbedder`'s session).
     text_session: Mutex<ort::session::Session>,
     vision_session: Mutex<ort::session::Session>,
     tokenizer: Tokenizer,
@@ -60,12 +61,12 @@ impl ClipEmbedder {
     pub fn load(cfg: ClipEmbedderConfig) -> NativeResult<Self> {
         let prep =
             PreprocessConfig::from_slices(cfg.resize, cfg.crop, &cfg.image_mean, &cfg.image_std)?;
-        let (text_session, active) = crate::build_session(&cfg.text_model_path, &cfg.providers)?;
-        let (vision_session, _) = crate::build_session(&cfg.vision_model_path, &cfg.providers)?;
+        let (text_session, active) = build_session(&cfg.text_model_path, &cfg.providers)?;
+        let (vision_session, _) = build_session(&cfg.vision_model_path, &cfg.providers)?;
 
         // Feed whichever of input_ids/attention_mask the text graph declares,
         // at its declared integer width (mirrors the Python engine's feed).
-        let text_inputs = crate::graph_inputs(&text_session, &["input_ids", "attention_mask"]);
+        let text_inputs = graph_inputs(&text_session, &["input_ids", "attention_mask"]);
         let vision_input_name = vision_session
             .inputs()
             .first()
@@ -138,13 +139,13 @@ impl ClipEmbedder {
             };
             feed.push((
                 input.name.clone(),
-                crate::int_tensor(batch, seq, data, input.int32)?,
+                int_tensor(batch, seq, data, input.int32)?,
             ));
         }
         let outputs = session
             .run(feed)
             .context(ErrorKind::InvalidInput, "clip text run failed")?;
-        let vectors = crate::extract_2d(&outputs)?;
+        let vectors = extract_2d(&outputs)?;
         let vectors = l2_normalize_rows(vectors);
         *self.dim.lock().expect("dim lock poisoned") = Some(vectors.ncols());
         Ok(vectors.rows().into_iter().map(|r| r.to_vec()).collect())
@@ -174,7 +175,7 @@ impl ClipEmbedder {
         let outputs = session
             .run(feed)
             .context(ErrorKind::InvalidInput, "clip vision run failed")?;
-        let vectors = crate::extract_2d(&outputs)?;
+        let vectors = extract_2d(&outputs)?;
         let vectors = l2_normalize_rows(vectors);
         *self.dim.lock().expect("dim lock poisoned") = Some(vectors.ncols());
         Ok(vectors.rows().into_iter().map(|r| r.to_vec()).collect())
@@ -191,7 +192,7 @@ impl ClipEmbedder {
 /// implementing BOTH compute traits — text and image chunks project into the
 /// shared CLIP space. Identity/batch policy come from the host (`WithPolicy`),
 /// execution from an adapter lane; `safe_batch` stays the probed-by-host
-/// default, exactly as for [`crate::TextEmbedder`].
+/// default, exactly as for [`super::text::TextEmbedder`].
 impl shrike_engine_api::EmbedText for ClipEmbedder {
     fn embed_chunk(&self, texts: &[String]) -> NativeResult<Vec<Vec<f32>>> {
         self.embed_text_chunk(texts)

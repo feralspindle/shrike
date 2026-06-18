@@ -1,9 +1,11 @@
 //! The generic remote-embeddings engine (#342 P4): [`EmbedText`] over any
 //! OpenAI-compatible embeddings endpoint — llama-server locally, a cloud
 //! embedding API with a key, a service across a tailnet. Route 1 of the
-//! engine contract: ureq is synchronous (no runtime), so the `Blocking`
-//! adapter moves each request onto the runtime's blocking pool and network
-//! calls never block a runtime worker.
+//! engine contract: sync `ureq` (no runtime), so the `Blocking` adapter moves
+//! each request onto the runtime's blocking pool and network calls never block
+//! a runtime worker. The shared SSRF/retry/api-key machinery lives in
+//! [`super::http`] (#708 dedup); this module holds only the embeddings-specific
+//! dialects.
 //!
 //! Since #501 it also speaks llama.cpp's NATIVE multimodal dialect for
 //! [`EmbedImages`]: `GET /props` advertises the loaded model's modalities
@@ -22,6 +24,7 @@
 //! `textprep=` policy suffixes) stays host-side — this crate only serves the
 //! raw identity ingredients (`/v1/models` id + meta, `/props` capabilities).
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -29,37 +32,22 @@ use serde::Deserialize;
 use shrike_engine_api::{EmbedImages, EmbedText, MediaItem};
 use shrike_error::{ErrorKind, NativeError, NativeResult, ResultExt};
 
+use super::http::{ModelInfo, PostOutcome, RemoteHttpClient};
+
 /// Per-request ceiling, matching the Python backend's httpx timeout.
 const EMBED_TIMEOUT: Duration = Duration::from_secs(60);
-const META_TIMEOUT: Duration = Duration::from_secs(5);
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Bounded retry on the embed path (the request is idempotent): cloud
 /// endpoints 429/503 routinely (rate limits, cold scale-up), so a transient
 /// failure must not sink the chunk. Mirrors the probe's small explicit
-/// attempts loop; this is a sync engine on the runtime's blocking pool, so
-/// the backoff is a plain `std::thread::sleep`.
+/// attempts loop.
 const EMBED_ATTEMPTS: u32 = 3;
-const BACKOFF_BASE: Duration = Duration::from_millis(250);
-/// A server-supplied `Retry-After` is honored but never trusted past this.
-const RETRY_AFTER_CAP: Duration = Duration::from_secs(10);
 
-/// 429 and 5xx are transient (rate limit, restart, overload); any other
-/// status is a request problem a retry can't fix.
-fn retryable_status(code: u16) -> bool {
-    code == 429 || (500..600).contains(&code)
-}
-
-/// The `Retry-After` seconds form, capped. The HTTP-date form is ignored
-/// (the default backoff covers it).
-fn retry_after(resp: &ureq::Response) -> Option<Duration> {
-    let secs: u64 = resp.header("retry-after")?.trim().parse().ok()?;
-    Some(Duration::from_secs(secs).min(RETRY_AFTER_CAP))
-}
-
-/// Exponential: 250ms, 500ms, … for attempt 1, 2, …
-fn backoff(attempt: u32) -> Duration {
-    BACKOFF_BASE * 2u32.saturating_pow(attempt.saturating_sub(1))
+/// Embeds have NO item-level rejection: any non-transient status is an
+/// endpoint/config problem that errors the chunk (unlike describe, where a 4xx
+/// can condemn a single image). The shared retry loop takes this predicate.
+fn no_item_level(_code: u16) -> bool {
+    false
 }
 
 pub struct RemoteEmbedderConfig {
@@ -74,26 +62,21 @@ pub struct RemoteEmbedderConfig {
     pub model: Option<String>,
 }
 
-/// The engine: a thin, stateless HTTP client (ureq agents are cheap and
-/// `Send + Sync`; each call is one request).
+/// The engine: a thin, stateless HTTP client wrapper.
 ///
-/// SSRF posture (#592): `base_url` is operator-configured and trusted (a
-/// loopback llama-server, a tailnet host, a cloud API the operator chose), so
-/// it is NOT `is_global`-gated. But the agent is built with auto-redirects OFF
-/// and **pinned to `base_url`'s resolved IP** (closing the DNS-rebinding
-/// TOCTOU), and a redirect is followed only when it stays on the SAME host (an
-/// embeddings endpoint that 30x-es you to a different host is the SSRF vector —
-/// `shrike_network::same_host_redirect` refuses it). NOTE: the IP is pinned once at
-/// construction; an endpoint whose address rotates mid-life (a cloud LB
-/// draining a node) would surface as a transient failure → the bounded retry,
-/// not silently wrong — reconstruct the engine to re-pin.
+/// SSRF posture lives in [`RemoteHttpClient`] (#592): the agent is pinned to
+/// `base_url`'s resolved IP with auto-redirects OFF, and a redirect is followed
+/// only when it stays on the SAME host.
 pub struct RemoteEmbedder {
-    base_url: String,
-    /// `base_url` parsed once, for the same-host redirect comparison.
-    base: url::Url,
-    api_key: Option<String>,
+    http: RemoteHttpClient,
     model: Option<String>,
-    agent: ureq::Agent,
+    /// The endpoint's resolved multimodal capabilities, cached after the first
+    /// successful `GET /props` (#708): the marker + vision flag are per-process
+    /// invariants of the endpoint, so the image path reads them ONCE rather than
+    /// re-probing per chunk (the documented per-chunk round-trip fix). Only a
+    /// SUCCESSFUL probe is cached — a text-only/absent `/props` falls through to
+    /// re-probe, preserving the original error behaviour exactly.
+    props: OnceLock<LlamaProps>,
 }
 
 #[derive(Deserialize)]
@@ -108,17 +91,6 @@ struct EmbeddingsResponse {
     data: Vec<EmbeddingItem>,
 }
 
-/// The identity ingredients from `/v1/models`: the model id and its numeric
-/// meta block (`n_params`, `n_embd`, …) as raw JSON for the host to fold
-/// into its fingerprint policy. Both empty when the endpoint doesn't serve
-/// them (an older llama.cpp, a minimal cloud API) — the host falls back to
-/// its configured identity.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ModelInfo {
-    pub id: Option<String>,
-    pub meta: serde_json::Map<String, serde_json::Value>,
-}
-
 /// llama.cpp server capabilities from `GET /props` (#501): which modalities
 /// the loaded model serves (an mmproj per modality), and the per-process
 /// `media_marker` a multimodal prompt references. The marker is randomized
@@ -131,62 +103,28 @@ pub struct LlamaProps {
 }
 
 impl RemoteEmbedder {
-    /// Construction validates the API key — it is interpolated into the
-    /// `Authorization` header, so a control character (a pasted key with a
-    /// stray newline) or leading/trailing whitespace must fail loudly here
-    /// as `invalid_input`, not as a garbled or injected header later.
+    /// Construction validates the API key (header-injection guard, in
+    /// [`RemoteHttpClient::new`]) and pins the endpoint's IP.
     pub fn new(cfg: RemoteEmbedderConfig) -> NativeResult<Self> {
-        if let Some(key) = &cfg.api_key {
-            if key.chars().any(char::is_control) || key.trim() != key {
-                return Err(NativeError::invalid_input(
-                    "api_key must not contain control characters or leading/trailing whitespace",
-                ));
-            }
-        }
-        let base_url = cfg.base_url.trim_end_matches('/').to_string();
-        // SSRF posture (#592): pin the connection to base_url's resolved IP with
-        // auto-redirects OFF. The agent-level timeout is a backstop; each request
-        // sets its own via `.timeout()`.
-        let (agent, base) = shrike_network::pinned_endpoint_agent(&base_url, EMBED_TIMEOUT)?;
+        let http = RemoteHttpClient::new(&cfg.base_url, cfg.api_key, EMBED_TIMEOUT)?;
         Ok(Self {
-            base_url,
-            base,
-            api_key: cfg.api_key,
+            http,
             model: cfg.model,
-            agent,
+            props: OnceLock::new(),
         })
     }
 
-    fn request(&self, method: &str, path: &str, timeout: Duration) -> ureq::Request {
-        self.request_abs(method, &format!("{}{}", self.base_url, path), timeout)
-    }
-
-    /// Build a request to an ABSOLUTE url (the redirect loop sends to the
-    /// validated same-host target, not a base-relative path).
-    fn request_abs(&self, method: &str, url: &str, timeout: Duration) -> ureq::Request {
-        let mut req = self.agent.request(method, url).timeout(timeout);
-        if let Some(key) = &self.api_key {
-            req = req.set("Authorization", &format!("Bearer {key}"));
-        }
-        req
-    }
-
-    /// `GET /health` is 200 — llama-server's readiness; other services may
-    /// not serve it (treated as not-healthy, the caller decides what that
-    /// means for its lifecycle).
+    /// `GET /health` is 200 — llama-server's readiness.
     pub fn health_ok(&self) -> bool {
-        self.request("GET", "/health", HEALTH_TIMEOUT)
-            .call()
-            .map(|r| r.status() == 200)
-            .unwrap_or(false)
+        self.http.health_ok()
     }
 
     /// llama.cpp's `GET /props` capabilities, or `None` when the endpoint
     /// doesn't serve the route (a cloud API, an old build) — which means
-    /// "no native multimodal dialect here", never an error.
+    /// "no native multimodal dialect here", never an error. This is the raw
+    /// probe; the image path caches it (see [`Self::resolved_props`]).
     pub fn props(&self) -> Option<LlamaProps> {
-        let resp = self.request("GET", "/props", META_TIMEOUT).call().ok()?;
-        let body = resp.into_json::<serde_json::Value>().ok()?;
+        let body = self.http.get_json("/props")?;
         let modalities = body.get("modalities")?;
         Some(LlamaProps {
             vision: modalities
@@ -204,139 +142,26 @@ impl RemoteEmbedder {
         })
     }
 
+    /// `/props`, read once and cached (#708): the marker + capabilities are
+    /// per-process invariants of the endpoint, so the image path probes the
+    /// first time and reuses thereafter instead of paying a round-trip per
+    /// chunk. Only a SUCCESSFUL probe is cached — `None` (no `/props`) falls
+    /// through to re-probe next chunk, identical to the original behaviour.
+    fn resolved_props(&self) -> Option<LlamaProps> {
+        if let Some(cached) = self.props.get() {
+            return Some(cached.clone());
+        }
+        let fresh = self.props()?;
+        // Race-tolerant: a concurrent probe may win the set; either value is the
+        // same per-process invariant, so take whichever landed.
+        let _ = self.props.set(fresh.clone());
+        Some(self.props.get().cloned().unwrap_or(fresh))
+    }
+
     /// The first `/v1/models` entry's id + meta (empty on any failure or
     /// shape mismatch — identity falls back to host config, never errors).
     pub fn model_info(&self) -> ModelInfo {
-        let Ok(resp) = self.request("GET", "/v1/models", META_TIMEOUT).call() else {
-            return ModelInfo::default();
-        };
-        let Ok(body) = resp.into_json::<serde_json::Value>() else {
-            return ModelInfo::default();
-        };
-        let Some(entry) = body.get("data").and_then(|d| d.get(0)) else {
-            return ModelInfo::default();
-        };
-        ModelInfo {
-            id: entry
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            meta: entry
-                .get("meta")
-                .and_then(|m| m.as_object())
-                .cloned()
-                .unwrap_or_default(),
-        }
-    }
-}
-
-impl RemoteEmbedder {
-    /// The bounded-retry POST both dialects share. A refused/failed request
-    /// is a service-availability problem (down, mid-restart, auth rejected),
-    /// not an engine bug. 429/5xx and transport failures are transient →
-    /// bounded retry; any other status fails immediately. A terminal status
-    /// error appends the server's own `error.message` when the body carries
-    /// one (llama.cpp's "model does not support multimodal requests", a
-    /// cloud API's auth detail) — the actionable half of the failure.
-    fn post_json_with_retry(
-        &self,
-        path: &str,
-        payload: &serde_json::Value,
-    ) -> NativeResult<ureq::Response> {
-        // The redirect loop (SSRF #592): auto-redirects are OFF, so a 3xx
-        // surfaces as Ok(resp). Follow it only if it stays on the SAME host
-        // (the pinned base host); a cross-host redirect is refused. Capped at
-        // shrike_network::MAX_REDIRECTS. Each URL gets its own transient-retry.
-        let mut current = format!("{}{}", self.base_url, path);
-        let mut from = self.base.clone();
-        for _hop in 0..=shrike_network::MAX_REDIRECTS {
-            let resp = self.post_one_url_with_retry(&current, payload)?;
-            if (300..400).contains(&resp.status()) {
-                let location = resp.header("location").ok_or_else(|| {
-                    NativeError::unavailable("redirect response without a Location header")
-                })?;
-                let target = shrike_network::same_host_redirect(&from, location)?;
-                current = target.to_string();
-                from = target;
-                continue;
-            }
-            return Ok(resp);
-        }
-        Err(NativeError::unavailable(format!(
-            "too many redirects (>{})",
-            shrike_network::MAX_REDIRECTS
-        )))
-    }
-
-    /// One absolute URL's bounded-retry POST (the per-URL half the redirect
-    /// loop drives). A 3xx is returned as Ok for the caller to follow/refuse.
-    fn post_one_url_with_retry(
-        &self,
-        url: &str,
-        payload: &serde_json::Value,
-    ) -> NativeResult<ureq::Response> {
-        let mut attempt = 1u32;
-        loop {
-            let err = match self
-                .request_abs("POST", url, EMBED_TIMEOUT)
-                .send_json(payload)
-            {
-                Ok(resp) => return Ok(resp),
-                // ureq surfaces a 3xx either as Ok (redirects disabled) or as
-                // Error::Status depending on version — return it for the
-                // redirect loop to follow/refuse, identically to the Ok case.
-                Err(ureq::Error::Status(code, resp)) if (300..400).contains(&code) => {
-                    return Ok(resp);
-                }
-                Err(e) => e,
-            };
-            let transient = match &err {
-                ureq::Error::Status(code, _) => retryable_status(*code),
-                ureq::Error::Transport(_) => true,
-            };
-            if !transient || attempt >= EMBED_ATTEMPTS {
-                let attempts = if transient {
-                    format!(" after {EMBED_ATTEMPTS} attempt(s)")
-                } else {
-                    String::new()
-                };
-                let detail = match err {
-                    ureq::Error::Status(code, resp) => {
-                        let msg = resp
-                            .into_json::<serde_json::Value>()
-                            .ok()
-                            .and_then(|b| {
-                                b.get("error")?.get("message")?.as_str().map(String::from)
-                            })
-                            .unwrap_or_default();
-                        if msg.is_empty() {
-                            format!("status {code}")
-                        } else {
-                            format!("status {code}: {msg}")
-                        }
-                    }
-                    ureq::Error::Transport(t) => t.to_string(),
-                };
-                return Err(NativeError::unavailable(format!(
-                    "embeddings request failed{attempts}: {detail}"
-                )));
-            }
-            let delay = match &err {
-                ureq::Error::Status(_, resp) => {
-                    retry_after(resp).unwrap_or_else(|| backoff(attempt))
-                }
-                ureq::Error::Transport(_) => backoff(attempt),
-            };
-            tracing::warn!(
-                attempt,
-                max_attempts = EMBED_ATTEMPTS,
-                delay_ms = delay.as_millis() as u64,
-                error = %err,
-                "transient embeddings failure; retrying"
-            );
-            std::thread::sleep(delay);
-            attempt += 1;
-        }
+        self.http.model_info()
     }
 }
 
@@ -355,7 +180,22 @@ impl EmbedText for RemoteEmbedder {
         if let Some(model) = &self.model {
             payload["model"] = serde_json::Value::String(model.clone());
         }
-        let resp = self.post_json_with_retry("/v1/embeddings", &payload)?;
+        let resp = match self.http.post_json_with_retry(
+            "/v1/embeddings",
+            &payload,
+            EMBED_ATTEMPTS,
+            EMBED_TIMEOUT,
+            "embeddings",
+            no_item_level,
+        )? {
+            PostOutcome::Response(resp) => resp,
+            // embed's predicate never condemns an item, so this is unreachable.
+            PostOutcome::ItemRejected => {
+                return Err(NativeError::internal(
+                    "embeddings request unexpectedly item-rejected",
+                ))
+            }
+        };
         let body: EmbeddingsResponse = resp
             .into_json()
             .context(ErrorKind::Internal, "malformed embeddings response")?;
@@ -404,15 +244,10 @@ impl EmbedImages for RemoteEmbedder {
         }
         let span = tracing::debug_span!("embed.remote_media_chunk", batch = images.len());
         let _enter = span.enter();
-        // NOTE (#501 slice B): `props()` is an extra round-trip per chunk —
-        // the `Blocking` image path now chunks by the host's image `safe_batch`
-        // (#211), so a full reindex re-probes ⌈images/safe_batch⌉ times (one
-        // chunk per kernel image batch when safe_batch ≥ the batch size, the
-        // normal case). The marker + capabilities are per-process invariants of
-        // the endpoint, so this belongs read-once at engine composition (the
-        // attach path that lands with the config/facade wiring) and cached,
-        // leaving only a cheap assertion here. Harmless to re-read meanwhile.
-        let props = self.props().ok_or_else(|| {
+        // `/props` is read ONCE at the first image chunk and cached (#708) — the
+        // marker + capabilities are per-process invariants of the endpoint, so
+        // a full reindex no longer re-probes per chunk.
+        let props = self.resolved_props().ok_or_else(|| {
             NativeError::unavailable(
                 "endpoint does not serve llama.cpp's /props — image embeddings need its \
                  native multimodal dialect (an OpenAI-style endpoint has no media path)",
@@ -442,7 +277,21 @@ impl RemoteEmbedder {
                 "multimodal_data": [base64::engine::general_purpose::STANDARD.encode(&item.bytes)],
             }
         });
-        let resp = self.post_json_with_retry("/embeddings", &payload)?;
+        let resp = match self.http.post_json_with_retry(
+            "/embeddings",
+            &payload,
+            EMBED_ATTEMPTS,
+            EMBED_TIMEOUT,
+            "embeddings",
+            no_item_level,
+        )? {
+            PostOutcome::Response(resp) => resp,
+            PostOutcome::ItemRejected => {
+                return Err(NativeError::internal(
+                    "embeddings request unexpectedly item-rejected",
+                ))
+            }
+        };
         let mut body: Vec<NativeEmbeddingItem> = resp
             .into_json()
             .context(ErrorKind::Internal, "malformed native embeddings response")?;
@@ -480,65 +329,8 @@ impl RemoteEmbedder {
 
 #[cfg(test)]
 mod tests {
+    use super::super::http::test_server::{canned_server, one_shot_server};
     use super::*;
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::TcpListener;
-    use std::sync::mpsc;
-
-    /// A canned HTTP server on an ephemeral port, serving one connection per
-    /// response in sequence (each closes its connection, so a retry is a
-    /// fresh accept): returns (base_url, a receiver yielding each raw
-    /// request head+body). A `status_line` may carry extra header lines
-    /// (`"HTTP/1.1 429 …\r\nRetry-After: 1"`).
-    fn canned_server(responses: Vec<(&'static str, String)>) -> (String, mpsc::Receiver<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for (status_line, body) in responses {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut head = String::new();
-                let mut content_length = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if let Some(v) = line
-                        .to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(str::trim)
-                    {
-                        content_length = v.parse().unwrap_or(0);
-                    }
-                    let done = line == "\r\n" || line == "\n" || line.is_empty();
-                    head.push_str(&line);
-                    if done {
-                        break;
-                    }
-                }
-                let mut req_body = vec![0u8; content_length];
-                if content_length > 0 {
-                    reader.read_exact(&mut req_body).unwrap();
-                }
-                head.push_str(&String::from_utf8_lossy(&req_body));
-                let _ = tx.send(head);
-                let response = format!(
-                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len(),
-                );
-                stream.write_all(response.as_bytes()).unwrap();
-            }
-        });
-        (format!("http://{addr}"), rx)
-    }
-
-    /// The one-request special case.
-    fn one_shot_server(
-        status_line: &'static str,
-        body: String,
-    ) -> (String, mpsc::Receiver<String>) {
-        canned_server(vec![(status_line, body)])
-    }
 
     fn engine(base_url: String, model: Option<&str>, key: Option<&str>) -> RemoteEmbedder {
         RemoteEmbedder::new(RemoteEmbedderConfig {
@@ -769,6 +561,7 @@ mod tests {
         assert!(rx.recv().unwrap().starts_with("POST /v1/embeddings"));
         assert!(rx.recv().unwrap().starts_with("POST /v2/embeddings"));
     }
+
     // ── The llama.cpp native multimodal dialect (#501) ──────────────────────
 
     const PROPS_MM: &str =

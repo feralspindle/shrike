@@ -4,17 +4,18 @@
 //! `shrike-llama-server`'s `chat_mode`), a cloud service with a key
 //! (OpenAI / OpenRouter / Gemini's OpenAI-compat endpoint accept the
 //! identical shape; Anthropic's native API differs — reach Claude via an
-//! OpenAI-compat gateway). Route 1 of the engine contract: ureq is
-//! synchronous, so the `Blocking` adapter moves each request onto the
-//! runtime's blocking pool.
+//! OpenAI-compat gateway). Route 1 of the engine contract: sync `ureq`, so
+//! the `Blocking` adapter moves each request onto the runtime's blocking
+//! pool. The shared SSRF/retry/api-key machinery lives in [`super::http`]
+//! (#708 dedup); this module holds only the describe-specific dialect.
 //!
-//! Scope discipline: this crate **talks to an endpoint**, nothing else —
-//! the `shrike-embed-remote` posture. Fingerprint *assembly* is host
-//! policy; this crate serves the raw ingredients (`/v1/models` id + meta)
-//! plus [`compose_fingerprint`], the recipe the host applies (which folds
-//! [`DESCRIBE_PROMPT_VERSION`] — the prompt is output-affecting exactly
-//! like `EMBED_TEXT_VERSION` — and the projector name for a local vision
-//! server, which `/v1/models` meta does NOT reflect).
+//! Scope discipline: this crate **talks to an endpoint**, nothing else — the
+//! [`super::embed`] posture. Fingerprint *assembly* is host policy; this
+//! module serves the raw ingredients (`/v1/models` id + meta) plus
+//! [`compose_fingerprint`], the recipe the host applies (which folds
+//! [`DESCRIBE_PROMPT_VERSION`] — the prompt is output-affecting exactly like
+//! `EMBED_TEXT_VERSION` — and the projector name for a local vision server,
+//! which `/v1/models` meta does NOT reflect).
 //!
 //! **Destination rule (settled in docs/decisions.md): VLM descriptions go
 //! to the embedding space only, never the trigram index.** Today's
@@ -39,7 +40,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use serde::Deserialize;
 use shrike_engine_api::{MediaItem, Recognition, RecognizeMedia};
-use shrike_error::{ErrorKind, NativeError, NativeResult, ResultExt};
+use shrike_error::{ErrorKind, NativeResult, ResultExt};
+
+use super::http::{ModelInfo, PostOutcome, RemoteHttpClient};
 
 /// Bump whenever [`DESCRIBE_PROMPT_V1`] (or whichever template ships)
 /// changes: the prompt is part of the output space, so a change must
@@ -60,20 +63,10 @@ pub const DESCRIBE_PROMPT_V1: &str = "Describe this image for search indexing. I
 /// Per-request ceiling: describe is far slower than embed (a local VLM can
 /// take tens of seconds per image on CPU).
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(120);
-const META_TIMEOUT: Duration = Duration::from_secs(5);
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Bounded retry on the describe path (the request is idempotent): cloud
-/// endpoints 429/503 routinely. Mirrors `shrike-embed-remote` verbatim.
+/// endpoints 429/503 routinely. Mirrors [`super::embed`].
 const DESCRIBE_ATTEMPTS: u32 = 3;
-const BACKOFF_BASE: Duration = Duration::from_millis(250);
-/// A server-supplied `Retry-After` is honored but never trusted past this.
-const RETRY_AFTER_CAP: Duration = Duration::from_secs(10);
-
-/// 429 and 5xx are transient (rate limit, restart, overload).
-fn retryable_status(code: u16) -> bool {
-    code == 429 || (500..600).contains(&code)
-}
 
 /// A status that condemns *this image*, not the endpoint: oversized,
 /// unsupported, or malformed input. The item degrades to the empty
@@ -81,18 +74,6 @@ fn retryable_status(code: u16) -> bool {
 /// problem and errors the chunk.
 fn item_level_status(code: u16) -> bool {
     matches!(code, 400 | 413 | 415 | 422)
-}
-
-/// The `Retry-After` seconds form, capped. The HTTP-date form is ignored
-/// (the default backoff covers it).
-fn retry_after(resp: &ureq::Response) -> Option<Duration> {
-    let secs: u64 = resp.header("retry-after")?.trim().parse().ok()?;
-    Some(Duration::from_secs(secs).min(RETRY_AFTER_CAP))
-}
-
-/// Exponential: 250ms, 500ms, … for attempt 1, 2, …
-fn backoff(attempt: u32) -> Duration {
-    BACKOFF_BASE * 2u32.saturating_pow(attempt.saturating_sub(1))
 }
 
 pub struct RemoteDescriberConfig {
@@ -135,37 +116,19 @@ impl Default for RemoteDescriberConfig {
     }
 }
 
-/// The engine: a thin, stateless HTTP client (ureq agents are cheap and
-/// `Send + Sync`; each call is one request).
+/// The engine: a thin, stateless HTTP client wrapper.
 ///
-/// SSRF posture (#592, same as `shrike-embed-remote`): `base_url` is
-/// operator-configured and trusted, so it is NOT `is_global`-gated — but the
-/// agent has auto-redirects OFF and is **pinned to `base_url`'s resolved IP**
-/// (closing the DNS-rebinding TOCTOU), and a redirect is followed only when it
-/// stays on the SAME host (`shrike_network::same_host_redirect` refuses a
-/// cross-host 30x — the SSRF vector). The IP is pinned once at construction;
-/// reconstruct to re-pin if the endpoint's address rotates.
+/// SSRF posture lives in [`RemoteHttpClient`] (#592, same as [`super::embed`]):
+/// the agent is pinned to `base_url`'s resolved IP with auto-redirects OFF, and
+/// a redirect is followed only when it stays on the SAME host.
 pub struct RemoteDescriber {
-    base_url: String,
-    /// `base_url` parsed once, for the same-host redirect comparison.
-    base: url::Url,
-    api_key: Option<String>,
+    http: RemoteHttpClient,
     model: Option<String>,
     prompt: String,
     max_tokens: u32,
     temperature: f32,
     detail: Option<String>,
     timeout: Duration,
-    agent: ureq::Agent,
-}
-
-/// The identity ingredients from `/v1/models` (same shape as
-/// `shrike-embed-remote`): id + numeric meta, both empty when the endpoint
-/// doesn't serve them.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ModelInfo {
-    pub id: Option<String>,
-    pub meta: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The host-side fingerprint recipe:
@@ -220,179 +183,31 @@ struct ChatResponse {
 }
 
 impl RemoteDescriber {
-    /// Construction validates the API key — it is interpolated into the
-    /// `Authorization` header, so a control character or stray whitespace
-    /// must fail loudly here as `invalid_input`, not as a garbled or
-    /// injected header later. (Verbatim `shrike-embed-remote` discipline.)
+    /// Construction validates the API key (header-injection guard, in
+    /// [`RemoteHttpClient::new`]) and pins the endpoint's IP.
     pub fn new(cfg: RemoteDescriberConfig) -> NativeResult<Self> {
-        if let Some(key) = &cfg.api_key {
-            if key.chars().any(char::is_control) || key.trim() != key {
-                return Err(NativeError::invalid_input(
-                    "api_key must not contain control characters or leading/trailing whitespace",
-                ));
-            }
-        }
-        let base_url = cfg.base_url.trim_end_matches('/').to_string();
         let timeout = cfg.timeout.unwrap_or(DESCRIBE_TIMEOUT);
-        // SSRF posture (#592): pin the connection to base_url's resolved IP with
-        // auto-redirects OFF. The agent-level timeout is a backstop; each request
-        // sets its own via `.timeout()`.
-        let (agent, base) = shrike_network::pinned_endpoint_agent(&base_url, timeout)?;
+        let http = RemoteHttpClient::new(&cfg.base_url, cfg.api_key, timeout)?;
         Ok(Self {
-            base_url,
-            base,
-            api_key: cfg.api_key,
+            http,
             model: cfg.model,
             prompt: cfg.prompt.unwrap_or_else(|| DESCRIBE_PROMPT_V1.to_string()),
             max_tokens: cfg.max_tokens,
             temperature: cfg.temperature,
             detail: cfg.detail,
             timeout,
-            agent,
         })
     }
 
-    fn request(&self, method: &str, path: &str, timeout: Duration) -> ureq::Request {
-        self.request_abs(method, &format!("{}{}", self.base_url, path), timeout)
-    }
-
-    /// Build a request to an ABSOLUTE url (the redirect loop sends to the
-    /// validated same-host target, not a base-relative path).
-    fn request_abs(&self, method: &str, url: &str, timeout: Duration) -> ureq::Request {
-        let mut req = self.agent.request(method, url).timeout(timeout);
-        if let Some(key) = &self.api_key {
-            req = req.set("Authorization", &format!("Bearer {key}"));
-        }
-        req
-    }
-
-    /// POST the chat payload, following SAME-HOST redirects (#592) and applying
-    /// the bounded transient retry per URL. `Ok(Some(resp))` is a 2xx; `Ok(None)`
-    /// is an item-level rejection (a 4xx the image caused — the caller degrades
-    /// to the empty recognition); `Err` is an endpoint-level failure. A
-    /// cross-host redirect is refused (the SSRF vector), capped at
-    /// `shrike_network::MAX_REDIRECTS`.
-    fn post_chat(&self, payload: &serde_json::Value) -> NativeResult<Option<ureq::Response>> {
-        let mut current = format!("{}/v1/chat/completions", self.base_url);
-        let mut from = self.base.clone();
-        for _hop in 0..=shrike_network::MAX_REDIRECTS {
-            let Some(resp) = self.post_chat_one_url(&current, payload)? else {
-                return Ok(None); // item-level reject
-            };
-            if (300..400).contains(&resp.status()) {
-                let location = resp.header("location").ok_or_else(|| {
-                    NativeError::unavailable("redirect response without a Location header")
-                })?;
-                let target = shrike_network::same_host_redirect(&from, location)?;
-                current = target.to_string();
-                from = target;
-                continue;
-            }
-            return Ok(Some(resp));
-        }
-        Err(NativeError::unavailable(format!(
-            "too many redirects (>{})",
-            shrike_network::MAX_REDIRECTS
-        )))
-    }
-
-    /// One absolute URL's bounded-retry chat POST. `Ok(Some(resp))` is a 2xx OR
-    /// a 3xx (returned for the redirect loop to follow/refuse); `Ok(None)` is an
-    /// item-level rejection; `Err` is endpoint-level.
-    fn post_chat_one_url(
-        &self,
-        url: &str,
-        payload: &serde_json::Value,
-    ) -> NativeResult<Option<ureq::Response>> {
-        let mut attempt = 1u32;
-        loop {
-            let err = match self
-                .request_abs("POST", url, self.timeout)
-                .send_json(payload)
-            {
-                Ok(resp) => return Ok(Some(resp)),
-                // A 3xx may surface as Error::Status — return it for the redirect
-                // loop, identically to the Ok(3xx) case.
-                Err(ureq::Error::Status(code, resp)) if (300..400).contains(&code) => {
-                    return Ok(Some(resp));
-                }
-                Err(e) => e,
-            };
-            // Item-level: this image is unprocessable (oversized, rejected,
-            // malformed) — degrade to the empty recognition, never sink the
-            // batch, never retry (a bad image won't improve).
-            if let ureq::Error::Status(code, _) = &err {
-                if item_level_status(*code) {
-                    tracing::warn!(status = code, "endpoint rejected an image; item skipped");
-                    return Ok(None);
-                }
-            }
-            // Endpoint-level: transient (429/5xx/transport) retries bounded;
-            // anything else (auth, bad route) errors the chunk immediately.
-            let transient = match &err {
-                ureq::Error::Status(code, _) => retryable_status(*code),
-                ureq::Error::Transport(_) => true,
-            };
-            if !transient {
-                return Err(NativeError::unavailable(format!(
-                    "describe request failed: {err}"
-                )));
-            }
-            if attempt >= DESCRIBE_ATTEMPTS {
-                return Err(NativeError::unavailable(format!(
-                    "describe request failed after {DESCRIBE_ATTEMPTS} attempt(s): {err}"
-                )));
-            }
-            let delay = match &err {
-                ureq::Error::Status(_, resp) => {
-                    retry_after(resp).unwrap_or_else(|| backoff(attempt))
-                }
-                ureq::Error::Transport(_) => backoff(attempt),
-            };
-            tracing::warn!(
-                attempt,
-                max_attempts = DESCRIBE_ATTEMPTS,
-                delay_ms = delay.as_millis() as u64,
-                error = %err,
-                "transient describe failure; retrying"
-            );
-            std::thread::sleep(delay);
-            attempt += 1;
-        }
-    }
-
-    /// `GET /health` is 200 — llama-server's readiness; other services may
-    /// not serve it (treated as not-healthy, the caller decides).
+    /// `GET /health` is 200 — llama-server's readiness.
     pub fn health_ok(&self) -> bool {
-        self.request("GET", "/health", HEALTH_TIMEOUT)
-            .call()
-            .map(|r| r.status() == 200)
-            .unwrap_or(false)
+        self.http.health_ok()
     }
 
     /// The first `/v1/models` entry's id + meta (empty on any failure or
     /// shape mismatch — identity falls back to host config, never errors).
     pub fn model_info(&self) -> ModelInfo {
-        let Ok(resp) = self.request("GET", "/v1/models", META_TIMEOUT).call() else {
-            return ModelInfo::default();
-        };
-        let Ok(body) = resp.into_json::<serde_json::Value>() else {
-            return ModelInfo::default();
-        };
-        let Some(entry) = body.get("data").and_then(|d| d.get(0)) else {
-            return ModelInfo::default();
-        };
-        ModelInfo {
-            id: entry
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            meta: entry
-                .get("meta")
-                .and_then(|m| m.as_object())
-                .cloned()
-                .unwrap_or_default(),
-        }
+        self.http.model_info()
     }
 
     /// One image through one chat-completions request. `Ok(empty)` for an
@@ -437,8 +252,16 @@ impl RemoteDescriber {
         }
 
         // Item-level rejection (a 4xx the image caused) → empty recognition.
-        let Some(resp) = self.post_chat(&payload)? else {
-            return Ok(empty_recognition());
+        let resp = match self.http.post_json_with_retry(
+            "/v1/chat/completions",
+            &payload,
+            DESCRIBE_ATTEMPTS,
+            self.timeout,
+            "describe",
+            item_level_status,
+        )? {
+            PostOutcome::Response(resp) => resp,
+            PostOutcome::ItemRejected => return Ok(empty_recognition()),
         };
 
         let body: ChatResponse = resp
@@ -482,61 +305,8 @@ impl RecognizeMedia for RemoteDescriber {
 
 #[cfg(test)]
 mod tests {
+    use super::super::http::test_server::{canned_server, one_shot_server};
     use super::*;
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::TcpListener;
-    use std::sync::mpsc;
-
-    /// A canned HTTP server on an ephemeral port, one connection per queued
-    /// response (ported from shrike-embed-remote's tests).
-    fn canned_server(responses: Vec<(&'static str, String)>) -> (String, mpsc::Receiver<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for (status_line, body) in responses {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut head = String::new();
-                let mut content_length = 0usize;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if let Some(v) = line
-                        .to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(str::trim)
-                    {
-                        content_length = v.parse().unwrap_or(0);
-                    }
-                    let done = line == "\r\n" || line == "\n" || line.is_empty();
-                    head.push_str(&line);
-                    if done {
-                        break;
-                    }
-                }
-                let mut req_body = vec![0u8; content_length];
-                if content_length > 0 {
-                    reader.read_exact(&mut req_body).unwrap();
-                }
-                head.push_str(&String::from_utf8_lossy(&req_body));
-                let _ = tx.send(head);
-                let response = format!(
-                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len(),
-                );
-                stream.write_all(response.as_bytes()).unwrap();
-            }
-        });
-        (format!("http://{addr}"), rx)
-    }
-
-    fn one_shot_server(
-        status_line: &'static str,
-        body: String,
-    ) -> (String, mpsc::Receiver<String>) {
-        canned_server(vec![(status_line, body)])
-    }
 
     fn chat_ok(text: &str) -> String {
         serde_json::json!({"choices": [{"message": {"role": "assistant", "content": text}}]})
