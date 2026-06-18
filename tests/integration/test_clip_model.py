@@ -20,9 +20,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from shrike.embedding_clip import ClipBackend
-from shrike.index import CALIB_MIN, activation_floor
-from shrike.tools import ACTIVATION_MARGIN
+from shrike.harness.engines.embedding.clip import ClipBackend
+from shrike.harness.index import ACTIVATION_MARGIN, CALIB_MIN, activation_floor
 from tests.integration.conftest import requires_clip, requires_shrike_native
 
 pytestmark = [pytest.mark.integration, pytest.mark.embedding]
@@ -114,7 +113,7 @@ class TestClipImageIndex:
         the server does it (native_embedder + the media-dir resolver pair)."""
         import shrike_native
 
-        from shrike.server import _make_image_resolver
+        from shrike.server.server import _make_image_resolver
 
         collection = str(tmp_path / "c.anki2")
         media_dir = collection[: -len(".anki2")] + ".media"
