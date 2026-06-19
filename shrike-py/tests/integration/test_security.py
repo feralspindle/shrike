@@ -172,6 +172,62 @@ class TestEmbeddingStartInputRobustness:
         assert httpx.get(f"{_base_url(server)}/status", timeout=5.0).status_code == 200
 
 
+class TestEmbeddingStartExecGate:
+    """`/embedding/start` must not let a caller choose the spawned binary, model,
+    subprocess args, or onnx providers unless the server is purely-local — the
+    #791 capability hole (an unauthenticated body reaching subprocess spawn was a
+    network RCE under --allow-remote). A non-purely-local server (here
+    `--no-dns-rebinding-protection`, the behind-a-proxy posture) refuses the
+    execution-shaping overrides with a 400 BEFORE anything spawns; a purely-local
+    server forwards them (the local operator IS the caller)."""
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"llama_server": "/tmp/evil-binary"},  # the direct-RCE param
+            {"extra_args": ["--rpc", "attacker:1234"]},  # attacker-influenced argv
+            {"model": "/tmp/attacker.gguf"},  # attacker-chosen file to load
+            {"onnx_providers": ["EvilExecutionProvider"]},  # provider .so loading
+            {"backend": "llama", "llama_server": "/tmp/evil"},  # combined
+        ],
+    )
+    def test_non_local_server_refuses_exec_overrides(self, server_factory, body: dict) -> None:
+        srv = server_factory("execgate-nolocal", extra_args=["--no-dns-rebinding-protection"])
+        resp = httpx.post(f"{_base_url(srv)}/embedding/start", json=body, timeout=10.0)
+        assert resp.status_code == 400, resp.text
+        assert "Execution-shaping parameters" in resp.json()["error"]
+        # The gate ran before any spawn — the server is unharmed.
+        assert httpx.get(f"{_base_url(srv)}/status", timeout=5.0).status_code == 200
+
+    def test_non_local_server_allows_runtime_knobs(self, server_factory) -> None:
+        # A body with only non-execution-shaping knobs is NOT gated; with no model
+        # configured it lands on the clean no-model 400, not the gate's 400.
+        srv = server_factory("execgate-knobs", extra_args=["--no-dns-rebinding-protection"])
+        resp = httpx.post(
+            f"{_base_url(srv)}/embedding/start",
+            json={"port": 9999, "threads": 2},
+            timeout=10.0,
+        )
+        assert resp.status_code == 400, resp.text
+        assert "Execution-shaping parameters" not in resp.json()["error"]
+
+    def test_purely_local_server_forwards_exec_overrides_past_the_gate(
+        self, server: ServerInfo
+    ) -> None:
+        # The default `server` fixture is purely-local: the same binary override a
+        # non-local server refuses is forwarded here, landing on the clean
+        # "no model configured" 400 — proving the gate let it through (a different
+        # 400 than the gate's, and still no spawn since no model is set).
+        resp = httpx.post(
+            f"{_base_url(server)}/embedding/start",
+            json={"llama_server": "/tmp/whatever"},
+            timeout=10.0,
+        )
+        assert resp.status_code == 400, resp.text
+        assert "Execution-shaping parameters" not in resp.json()["error"]
+        assert httpx.get(f"{_base_url(server)}/status", timeout=5.0).status_code == 200
+
+
 class TestActionsErrorEnvelope:
     """The actions-over-HTTP edge returns ONE error envelope, and it must
     not leak server internals on any error code. The envelope is

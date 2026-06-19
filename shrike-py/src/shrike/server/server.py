@@ -212,6 +212,36 @@ _server_is_purely_local = server_is_purely_local
 _validate_media_path_root = validate_path_root
 
 
+# POST /embedding/start overrides that choose WHAT the embedding backend
+# executes or loads: the binary (llama_server → arbitrary subprocess), the model
+# file it deserializes, the verbatim subprocess args (extra_args), the onnx
+# execution-provider shared libraries, and the backend kind that selects among
+# them. On a purely-local server the loopback caller IS the operator (the same
+# trust as editing the config or running the binary directly), so these stay
+# settable — the CLI's `shrike embedding start --llama-server/--embedding-model`
+# flow rides this. On any server that is NOT purely-local the loopback peer may
+# be a reverse proxy / tailnet fronting a remote client, so an override here is
+# refused and the daemon falls back to its boot-configured embedding settings —
+# a remote caller can trigger a start but never redirect the spawned process.
+# The remaining body keys
+# (port/context_size/threads/gpu_layers/pooling/batch_size) are runtime knobs,
+# not execution-shaping, and pass through on any bind.
+_EXEC_SHAPING_OVERRIDES = ("backend", "model", "llama_server", "extra_args", "onnx_providers")
+
+
+def _rejected_exec_overrides(overrides: dict[str, Any], *, purely_local: bool) -> list[str]:
+    """Execution-shaping override keys a non-purely-local server must refuse.
+
+    Empty when the server is purely-local (the loopback caller is the trusted
+    operator) or the body carried none of :data:`_EXEC_SHAPING_OVERRIDES`. A
+    non-empty result is the set to reject — the daemon then starts with its
+    boot-configured settings rather than the caller's chosen binary/model/args.
+    """
+    if purely_local:
+        return []
+    return [k for k in _EXEC_SHAPING_OVERRIDES if k in overrides]
+
+
 def create_mcp(
     *,
     host: str,
@@ -257,6 +287,7 @@ def _register_custom_routes(
     action_tools: dict[str, Tool] | None = None,
     manager: CollectionManager | None = None,
     export_store: Any | None = None,
+    server_purely_local: bool = False,
 ) -> None:
     """Register custom HTTP endpoints on the server.
 
@@ -455,6 +486,34 @@ def _register_custom_routes(
                 ):
                     if body.get(key) is not None:
                         overrides[key] = body[key]
+
+        # Execution-shaping overrides (the binary, model, subprocess args, onnx
+        # providers, backend kind) are refused unless the server is purely-local
+        # — otherwise a remote/proxied caller could point the spawned embedding
+        # process at an attacker-chosen binary/args. Runtime knobs in the body
+        # still pass through; the daemon falls back to its boot-configured
+        # binary/model for the refused keys.
+        rejected = _rejected_exec_overrides(overrides, purely_local=server_purely_local)
+        if rejected:
+            logger.warning(
+                "Refusing /embedding/start overrides %s: the server is not purely-local, so "
+                "the caller-supplied binary/model/args are ignored in favour of the daemon's "
+                "boot-configured embedding settings",
+                rejected,
+            )
+            return JSONResponse(
+                {
+                    "error": (
+                        "Execution-shaping parameters ("
+                        + ", ".join(_EXEC_SHAPING_OVERRIDES)
+                        + ") may only be set via /embedding/start on a purely-local server "
+                        "(loopback bind, no --allow-remote, DNS-rebinding guard on, no extra "
+                        "--allowed-host/--allowed-origin). Configure them at daemon startup "
+                        "(--embedding-*/--llama-server/--config) instead."
+                    )
+                },
+                status_code=400,
+            )
 
         try:
             # Starting a backend blocks (model load + health wait); the kernel
@@ -1495,6 +1554,7 @@ def main() -> None:
             action_tools=action_tools,
             manager=manager,
             export_store=export_store,
+            server_purely_local=purely_local,
         )
 
         logger.info(

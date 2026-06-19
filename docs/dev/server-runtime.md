@@ -117,7 +117,7 @@ All custom routes sit behind the same `_guard` check.
 | `POST /shutdown` | Graceful shutdown. |
 | `POST /index/rebuild` | Full rebuild (returns immediately with status/progress); requires embedding running. |
 | `POST /index/save` | Immediate flush off the event loop. |
-| `POST /embedding/start` / `/embedding/stop` | Cycle the embedding service on a running server. |
+| `POST /embedding/start` / `/embedding/stop` | Cycle the embedding service on a running server. Execution-shaping overrides in the start body (`backend`/`model`/`llama_server`/`extra_args`/`onnx_providers`) are honored only on a purely-local server; otherwise refused (400) so a remote/proxied caller can't redirect the spawned process — the daemon falls back to its boot-configured settings. Runtime knobs (port/threads/…) pass through on any bind. |
 | `POST /reload` | Close and re-open the collection (picks up a restored backup or sync swap) and re-check drift. Backs `shrike collection reload`. |
 
 `/reload` shares its reopen primitive (`CollectionWrapper.reopen` plus reading
