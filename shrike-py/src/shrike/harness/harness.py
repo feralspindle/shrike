@@ -147,11 +147,11 @@ class _RecognitionEngine:
 
 
 class DedupStatsRecorder:
-    """Rolling dedup best-match statistics: one sample per upsert draft note —
-    the best SEMANTIC neighbor cosine, or a no-match tick. The calibration
-    feedstock for the dedup threshold; loop-confined (the actions record on the
-    event loop), so no lock. Process-lifetime only — a restart starts fresh
-    (durable accumulation is a later refinement)."""
+    """Rolling dedup best-match statistics: one sample per search query group —
+    the best SEMANTIC cosine, or a no-match tick. The calibration feedstock for
+    the dedup threshold; loop-confined (the actions record on the event loop),
+    so no lock. Process-lifetime only — a restart starts fresh (durable
+    accumulation is a later refinement)."""
 
     BUCKETS = 20
 
@@ -262,9 +262,8 @@ class KernelIndexView:
         return [v for v in out if v is not None]
 
     def search(self, texts: list[str], top_k: int = 10) -> list[list[dict[str, Any]]]:
-        """Nearest **text** neighbors per query (the upsert-neighbors path):
-        one list per text of ``{note_id, distance}`` dicts, over the kernel's
-        engine."""
+        """Nearest **text** neighbors per query: one list per text of
+        ``{note_id, distance}`` dicts, over the kernel's engine."""
         vectors = self.embed_queries(texts)
         if vectors is None:
             return [[] for _ in texts]
@@ -335,6 +334,22 @@ class Harness:
         # Background maintenance tasks: tracked so close() drains them (no
         # destroyed-pending teardown) and tests can settle deterministically.
         self._bg_tasks: set[asyncio.Task[Any]] = set()
+        # The readiness MARKER tasks (`_settle_and_mark_ready`) are tracked
+        # apart from the maintenance work they wait on. A marker awaits
+        # settle_background(), which gathers the OTHER bg tasks — so a marker
+        # must never gather a sibling marker, or two concurrent re-acquires
+        # deadlock (M1 awaits M2 awaiting M1, neither sets _ready). Markers
+        # wait only on maintenance; close() still drains them via _bg_tasks.
+        self._settle_markers: set[asyncio.Task[Any]] = set()
+        # The readiness barrier (#850): boot / reload / cooperative re-acquire
+        # run their index+derived maintenance to quiescence and set this Event;
+        # the data plane and tests await it instead of polling status + sleeping.
+        # A GENERATION counter makes it re-entrant — a /reload or re-acquire
+        # mid-flight bumps the generation, so a stale stage's "ready" can never
+        # strand the gate at the newer generation (the ready→not-ready→ready
+        # transition the doc warns about).
+        self._ready = asyncio.Event()
+        self._generation = 0
         # Recognition: per-purpose engine state, keyed by the kernel source
         # string (`"ocr"`/`"vlm"`). Empty = nothing attached (a distinct,
         # representable state from "attached but errored"). Each row carries its
@@ -423,10 +438,14 @@ class Harness:
     # -- boot ------------------------------------------------------------------
 
     async def boot(self, *, start_embedding: bool) -> None:
-        """One-shot boot orchestration on the loop: log the collection shape,
-        start + attach embedding (degrading on failure), reconcile index drift
-        in the background, build the derived store on drift, and install the
-        cooperative re-acquire hook."""
+        """One-shot boot orchestration on the loop, run as ORDERED stages with a
+        single re-entrant readiness barrier (#850): log the collection shape,
+        start + attach embedding (degrading on failure), kick off the index
+        drift reconcile + the derived-store build, then drive them to quiescence
+        and open the data plane (``await_ready``). Returns only once ready, so
+        ``await harness.boot()`` is the deterministic boot await (no status poll
+        + sleep). Finally installs the cooperative re-acquire hook."""
+        generation = self._begin_generation()
         summary = (await self.wrapper.get_collection_info(["summary"], []))["summary"]
         logger.info(
             "Collection ready: %d notes, %d decks, %d note types",
@@ -447,6 +466,12 @@ class Harness:
         # The derived-text store builds whether or not a backend is configured.
         await self._maybe_build_derived()
 
+        # Drive the boot maintenance to quiescence (the kernel serializes the
+        # index reconcile + derived rebuild through its ingest actor), then open
+        # the data plane. The ordering that closed the #828/#650 race family is
+        # the kernel's (Theme A); the barrier is the deterministic ready signal.
+        await self._settle_and_mark_ready(generation)
+
         if self.wrapper.cooperative:
             self.wrapper.set_acquire_hook(self._on_reacquire(asyncio.get_running_loop()))
             # Release now so a freshly-booted, never-touched idle daemon doesn't
@@ -466,9 +491,15 @@ class Harness:
         return hook
 
     def _spawn_reacquire_tasks(self, col_mod: int) -> None:
+        # A re-acquire is a new readiness generation: the data plane goes
+        # not-ready until the re-driven index/derived maintenance settles. The
+        # marker task awaits the spawned rebuilds (settle_background excludes it)
+        # then re-opens the gate at this generation.
+        generation = self._begin_generation()
         if self.derived.check_drift(col_mod):
             self._spawn_bg(self._rebuild_derived())
         self._spawn_bg(self._drive_reindex())
+        self._spawn_marker(generation)
 
     async def _drive_reindex(self) -> None:
         if await self.kernel.reindex_if_needed():
@@ -493,11 +524,64 @@ class Harness:
         task.add_done_callback(_log_task_failure)
         return task
 
+    def _spawn_marker(self, generation: int) -> asyncio.Task[Any]:
+        """Spawn a readiness marker for `generation` and register it as a marker
+        so settle_background() never awaits it (a marker waits on maintenance,
+        not on other markers — see settle_background)."""
+        task = self._spawn_bg(self._settle_and_mark_ready(generation))
+        self._settle_markers.add(task)
+        task.add_done_callback(self._settle_markers.discard)
+        return task
+
     async def settle_background(self) -> None:
         """Await in-flight background maintenance (drift rebuilds, reindex
-        drivers) — deterministic boots for tests and operational verbs."""
-        while self._bg_tasks:
-            await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
+        drivers) — deterministic boots for tests and operational verbs. Excludes
+        every readiness MARKER task (`_settle_and_mark_ready`), not just the
+        caller: a marker gathers only the maintenance it waits on, so two
+        concurrent re-acquires can't deadlock on each other's markers.
+
+        Excludes the recognition sweep too. Readiness is "the index/derived
+        maintenance has settled"; a recognition sweep (OCR/ASR, many seconds) is
+        NOT that maintenance, and gating readiness on it would park the data plane
+        behind a re-acquire/reload that overlapped a live sweep. The sweep's own
+        writes still serialize through the kernel ingest actor; close() drains it
+        directly (via `_bg_tasks`)."""
+        while True:
+            pending = [
+                t
+                for t in self._bg_tasks
+                if t not in self._settle_markers and t is not self._recognition_task
+            ]
+            if not pending:
+                break
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def _begin_generation(self) -> int:
+        """Open a new readiness generation: the data plane goes not-ready until
+        this generation's maintenance settles. Returns the generation token."""
+        self._generation += 1
+        self._ready.clear()
+        return self._generation
+
+    async def _settle_and_mark_ready(self, generation: int) -> None:
+        """Drain this generation's boot maintenance — the background index/
+        derived rebuilds AND the kernel ingest queue — then open the data plane,
+        but ONLY if a newer generation hasn't superseded it (re-entrancy)."""
+        await self.settle_background()
+        await self.kernel.settle()
+        if generation == self._generation:
+            self._ready.set()
+
+    async def await_ready(self) -> None:
+        """Block until the current generation's boot maintenance has settled —
+        the one deterministic readiness await the data plane and tests use
+        instead of polling derived/index status + sleeping."""
+        await self._ready.wait()
+
+    @property
+    def is_ready(self) -> bool:
+        """Whether the data plane is open (the current generation settled)."""
+        return self._ready.is_set()
 
     async def _rebuild_derived(self) -> None:
         # Kernel-side rebuild: the kernel op collects + builds crate-side
@@ -552,6 +636,13 @@ class Harness:
         }
         if (dedup := self.dedup_stats.snapshot()) is not None:
             status["dedup"] = dedup
+        # Degraded-writer signal: non-zero means the sole ingest-drain writer
+        # caught a panic (likely a poisoned lock), skipped that work, and
+        # survived — the affected notes are un-indexed until a reconcile heals
+        # them. Emitted only when non-zero, so a healthy server's shape is
+        # unchanged.
+        if (drain_panics := self.kernel.ingest_drain_panics()) > 0:
+            status["ingest_drain_panics"] = drain_panics
         # Per-engine recognition status: a map keyed by source — one row per
         # attached purpose, each {state, backend, fingerprint}. An empty map is
         # "nothing attached" (distinct from an attached-but-errored engine).
@@ -803,53 +894,23 @@ class Harness:
     ) -> dict[str, Any]:
         """Drive bounded recognition sweeps until nothing is pending.
 
-        Each kernel call recognizes at most ``batch_size`` images then yields
-        the executor, so collection ops interleave; the harness runs this as
-        a background task (the reindex discipline). Returns the final report
-        plus the total stored across the run."""
-        total_stored = 0
-        batches = 0
-        while True:
-            report: dict[str, Any] = json.loads(await self.kernel.recognize_pending(batch_size))
-            total_stored += int(report.get("stored", 0))
-            batches += 1
-            # ``batches`` is the count of kernel sweep calls this run made — the
-            # observable that distinguishes the no-progress STOP (returns after
-            # one no-progress batch) from a livelock REGRESSION (would re-take
-            # the same window every call). Surfaced so a test can assert the
-            # driver stopped by logic, not by a wall-clock timeout.
-            if report.get("status") != "ran" or int(report.get("remaining", 0)) == 0:
-                report["total_stored"] = total_stored
-                report["batches"] = batches
-                if total_stored:
-                    logger.info(
-                        "Recognition sweep stored %d item(s) over %d batch(es)",
-                        total_stored,
-                        batches,
-                    )
-                return report
-            if int(report.get("recognized", 0)) == 0:
-                # No progress: nothing in this batch was drainable (an
-                # unreadable prefix of the pending order — skipped items stay
-                # pending, so the next batch would re-take the same window
-                # forever). Stop here; the next sweep trigger (boot, /reload,
-                # cooperative re-acquire) retries when the read may have
-                # healed. Keyed on recognized == 0, NOT stored == 0: a batch
-                # that recognized items but gated them all out did real work
-                # (the reads drained, recognition ran) and must not stop the
-                # sweep.
-                report["total_stored"] = total_stored
-                report["batches"] = batches
-                logger.warning(
-                    "Recognition sweep stopped on a no-progress batch "
-                    "(%d item(s) still pending, unreadable)",
-                    int(report.get("remaining", 0)),
-                )
-                return report
-            if max_batches is not None and batches >= max_batches:
-                report["total_stored"] = total_stored
-                report["batches"] = batches
-                return report
+        The drive-to-quiescence loop lives in the KERNEL now
+        (``recognize_all_pending``): one FFI crossing instead of one per batch,
+        with the no-progress STOP and the per-purpose abort decided in the
+        runtime that owns both stores. Each internal batch keeps the bounded-
+        batch yield so collection ops interleave. Returns the final report plus
+        the run totals (``total_stored``, ``batches``)."""
+        report: dict[str, Any] = json.loads(
+            await self.kernel.recognize_all_pending(batch_size, max_batches)
+        )
+        total_stored = int(report.get("total_stored", 0))
+        if total_stored:
+            logger.info(
+                "Recognition sweep stored %d item(s) over %d batch(es)",
+                total_stored,
+                int(report.get("batches", 0)),
+            )
+        return report
 
     def start_recognition(self, kind: str) -> None:
         """Construct + attach an OCR backend by kind and launch a background
@@ -1016,7 +1077,11 @@ class Harness:
     # -- lifecycle ----------------------------------------------------------------
 
     async def reload(self) -> dict[str, Any]:
-        """Close and re-open the collection; re-check drift (``POST /reload``)."""
+        """Close and re-open the collection; re-check drift (``POST /reload``).
+        A new readiness generation: the data plane goes not-ready until the
+        re-driven maintenance settles, so an in-flight reload can't strand the
+        gate (the generation counter)."""
+        generation = self._begin_generation()
         await self.wrapper.reopen()
         col_mod = await self.wrapper.col_mod()
         await self._maybe_build_derived()
@@ -1030,6 +1095,7 @@ class Harness:
                 # _drive_boot_reindex) recalibrates, and /reload must too.
                 # No-op at N=1 (the kernel returns an empty list with no secondaries).
                 await self._recalibrate_secondary_floors()
+        await self._settle_and_mark_ready(generation)
         return {"status": "reloaded", "col_mod": col_mod, "rebuilding": rebuilding}
 
     async def close(self) -> None:

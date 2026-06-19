@@ -489,6 +489,20 @@ impl IndexOrchestrator {
         Some((to_embed, to_remove))
     }
 
+    /// Whether per-note state exists (the reconcile diff baseline). `false`
+    /// before the first build — a reconcile then falls back to a full rebuild.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shared-state mutex is poisoned (a prior holder panicked).
+    pub fn has_hashes(&self) -> bool {
+        self.shared
+            .lock()
+            .expect("orchestrator poisoned")
+            .note_hashes
+            .is_some()
+    }
+
     /// The current build/availability state.
     ///
     /// # Panics
@@ -673,126 +687,66 @@ impl IndexOrchestrator {
     }
 }
 
-/// The debounced saver on the kernel's own clock (tokio::time;
-/// mirrors `IndexSaver`): a flush `delay` seconds after the last change, or
-/// immediately at `threshold` unsaved changes — whichever first. The armed
-/// timer is one spawned task sleeping then flushing; re-arm aborts it (an
-/// abort lands only at the sleep — once past it the flush completes, which
-/// is fine: flush is idempotent).
+/// The debounced index saver: a flush `delay` seconds after the last change,
+/// or immediately at `threshold` unsaved changes — whichever first — expressed
+/// over the shared [`crate::maintenance::Maintenance`] coalescing job. The file
+/// write rides the compute pool (`dispatch_compute`), never a runtime worker or
+/// an op tail; a re-save coalesced in mid-write is itself debounced
+/// (`window == delay`). [`flush`](Self::flush) is the synchronous shutdown
+/// path: it disarms the job and writes inline, so `close()` returns only after
+/// the write lands.
 pub struct DebouncedSaver {
     orchestrator: Arc<IndexOrchestrator>,
-    delay: std::time::Duration,
-    threshold: u64,
-    pending: Mutex<PendingState>,
-}
-
-#[derive(Default)]
-struct PendingState {
-    changes: u64,
-    armed: Option<tokio::task::AbortHandle>,
+    job: Arc<crate::maintenance::Maintenance>,
 }
 
 impl DebouncedSaver {
     /// Build a saver over `orchestrator` with the idle-debounce `delay_secs`
     /// (clamped non-negative) and the burst-cap `threshold`.
     pub fn new(orchestrator: Arc<IndexOrchestrator>, delay_secs: f64, threshold: u64) -> Arc<Self> {
-        Arc::new(Self {
-            orchestrator,
-            delay: std::time::Duration::from_secs_f64(delay_secs.max(0.0)),
+        let delay = std::time::Duration::from_secs_f64(delay_secs.max(0.0));
+        let orch = Arc::clone(&orchestrator);
+        let job = crate::maintenance::Maintenance::new(
+            Box::new(move || {
+                let orch = Arc::clone(&orch);
+                Box::pin(async move {
+                    // The blocking file write rides the compute pool; a detached
+                    // runtime future (driven by `drive_io`) awaits the pool job,
+                    // keeping the write off every timer and op-tail path.
+                    let save = crate::runtime::dispatch_compute(move || {
+                        orch.save().map_err(|e| {
+                            tracing::warn!(error = ?e, "debounced index save failed");
+                            e
+                        })
+                    });
+                    let _ = save.await;
+                })
+            }),
+            delay,
+            delay,
             threshold,
-            pending: Mutex::new(PendingState::default()),
-        })
+        );
+        Arc::new(Self { orchestrator, job })
     }
 
     /// Record a change: re-arm the idle timer, or flush now at the burst cap.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the pending-state mutex is poisoned (a prior holder panicked).
-    pub fn request_save(self: &Arc<Self>) {
-        // abort-old + spawn + store happen under ONE lock scope: two
-        // concurrent op tails re-arming must never each take a None and
-        // leave an orphaned (un-abortable) timer behind. The spawn is
-        // non-blocking, so holding the std mutex across it is fine.
-        let mut pending = self.pending.lock().expect("saver poisoned");
-        pending.changes += 1;
-        if let Some(armed) = pending.armed.take() {
-            armed.abort();
-        }
-        if pending.changes >= self.threshold {
-            drop(pending);
-            // Off the op tail, so the burst-cap upsert's caller doesn't eat the
-            // multi-second file write inline.
-            self.flush_background();
-            return;
-        }
-        let this = Arc::clone(self);
-        let delay = self.delay;
-        let task = crate::runtime::handle().spawn(async move {
-            tokio::time::sleep(delay).await;
-            // Blocking fs work belongs on the blocking pool, not a runtime
-            // worker.
-            this.flush_background();
-        });
-        pending.armed = Some(task.abort_handle());
+    pub fn request_save(&self) {
+        self.job.request();
     }
 
-    /// Unsaved changes since the last flush.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the pending-state mutex is poisoned (a prior holder panicked).
+    /// Unsaved changes since the last flush was handed off.
     pub fn pending_changes(&self) -> u64 {
-        self.pending.lock().expect("saver poisoned").changes
+        self.job.pending()
     }
 
-    /// Disarm the timer and zero the counter — synchronously, so
-    /// `pending_changes` means "changes not yet handed to a flush" regardless
-    /// of where the file write runs.
-    fn reset_pending(&self) {
-        let mut pending = self.pending.lock().expect("saver poisoned");
-        if let Some(armed) = pending.armed.take() {
-            // Possibly our own handle (the timer task flushing) — an
-            // abort after the sleep is a no-op.
-            armed.abort();
-        }
-        pending.changes = 0;
-    }
-
-    /// Flush synchronously: disarm the timer, zero the counter, and persist
-    /// (a save failure is logged, not propagated — used at shutdown so close()
+    /// Flush synchronously: disarm the job, zero the counter, and persist (a
+    /// save failure is logged, not propagated — used at shutdown so close()
     /// returns only after the write lands).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the pending-state mutex is poisoned (a prior holder panicked).
     pub fn flush(&self) {
-        self.reset_pending();
+        self.job.cancel();
         if let Err(e) = self.orchestrator.save() {
             tracing::warn!(error = ?e, "debounced index save failed");
         }
-    }
-
-    /// `flush`, but the file write rides the blocking pool — the timer and
-    /// burst-threshold paths use this so neither a tokio worker nor an op
-    /// tail carries the multi-second write. The counter resets
-    /// synchronously (same contract as `flush`); shutdown keeps the
-    /// synchronous `flush` so close() returns only after the write lands.
-    fn flush_background(self: &Arc<Self>) {
-        self.reset_pending();
-        let this = Arc::clone(self);
-        // The blocking file write rides the compute pool (`dispatch_compute`);
-        // fire-and-forget, so a detached runtime task (driven by `drive_io`)
-        // awaits the pool job's completion off the timer and op-tail paths.
-        let save = crate::runtime::dispatch_compute(move || {
-            this.orchestrator.save().map_err(|e| {
-                tracing::warn!(error = ?e, "debounced index save failed");
-                e
-            })
-        });
-        crate::runtime::handle().spawn(async move {
-            let _ = save.await;
-        });
     }
 }
 
@@ -990,6 +944,40 @@ pub const CALIB_MIN: usize = 30;
 pub const CALIB_K: usize = 2;
 /// Embed/add chunk size (mirrors `index.BATCH_SIZE`).
 pub const BATCH_SIZE: usize = 64;
+
+/// How many notes a streaming (re)build reads + carries per chunk. Larger than
+/// [`BATCH_SIZE`] (the embed sub-batch) to amortize the per-chunk collection
+/// read; small enough that the bounded channel's prefetch is O(chunk) memory,
+/// not O(collection).
+pub const STREAM_CHUNK: usize = 512;
+
+/// Feed a materialized `inputs` Vec into the streaming (re)build core, so one
+/// code path serves both an in-hand Vec (tests/compose) and the kernel's
+/// pipelined collection-read stream. The Vec is already materialized — there is
+/// no read to overlap — so this synchronously pre-loads every chunk into a
+/// channel sized to hold them all (no spawn, no runtime dependency; the
+/// orchestrator's own tests drive it under a bare `block_on`). The kernel's
+/// real streaming uses a depth-bounded channel + a producer task for the
+/// read‖embed overlap.
+fn chunk_channel(
+    inputs: Vec<EmbedInput>,
+) -> tokio::sync::mpsc::Receiver<NativeResult<Vec<EmbedInput>>> {
+    let mut it = inputs.into_iter();
+    let mut chunks: Vec<Vec<EmbedInput>> = Vec::new();
+    loop {
+        let chunk: Vec<EmbedInput> = it.by_ref().take(STREAM_CHUNK).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        chunks.push(chunk);
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(chunks.len().max(1));
+    for chunk in chunks {
+        // The channel holds every chunk by construction, so `try_send` fits.
+        let _ = tx.try_send(Ok(chunk));
+    }
+    rx
+}
 const TEXT: &str = "text";
 
 /// One note's embedding inputs (mirrors the Python `NoteEmbedInput`).
@@ -1180,10 +1168,17 @@ impl IndexOrchestrator {
                     if replace {
                         let _ = self.engine.remove(&keys)?;
                     }
-                    self.engine.add(TEXT, &keys, &vectors)?;
-                    if !ocr_keys.is_empty() {
-                        self.engine.add(TEXT, &ocr_keys, &ocr_vectors)?;
-                    }
+                    // Atomic per-note text add (#855): a note's field-text
+                    // vectors AND its OCR/ASR vectors (same TEXT modality,
+                    // different keys) land in ONE engine call — so neither a
+                    // concurrent search nor a debounced save can ever observe or
+                    // persist a half-indexed note (the field vector present, the
+                    // recognition vector missing — the #650 flake class).
+                    let mut text_keys = keys;
+                    let mut text_vectors = vectors;
+                    text_keys.extend(ocr_keys);
+                    text_vectors.extend(ocr_vectors);
+                    self.engine.add(TEXT, &text_keys, &text_vectors)?;
                     if !image_keys.is_empty() {
                         let image_ndim = image_vectors.first().map(Vec::len).unwrap_or(0);
                         self.engine.ensure("image", image_ndim)?;
@@ -1303,7 +1298,40 @@ impl IndexOrchestrator {
         images: Option<(&dyn ImageEmbedder, &dyn ImageResolver)>,
         mode: WriteMode,
     ) -> NativeResult<()> {
+        // Feed the in-hand Vec through the streaming core (one code path; a
+        // single-chunk channel for tests/compose, a pipelined collection-read
+        // stream for the kernel).
         let total = inputs.len() as u64;
+        let rx = chunk_channel(inputs);
+        self.rebuild_streamed(rx, total, col_mod, model_id, embedder, images, mode)
+            .await
+    }
+
+    /// The streaming full-rebuild core: clear the index, then drain `chunks` —
+    /// embedding + adding each chunk as it arrives — so peak embed memory is
+    /// O(chunk), not O(collection), and the producer's next read overlaps this
+    /// chunk's embed. `apply` (`replace = false`) maintains the per-note hashes.
+    /// `total` feeds the progress gauge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a chunk read, embedding, or an engine write fails (the
+    /// state flips to [`OrchestratorState::Error`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shared-state mutex is poisoned (a prior holder panicked).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn rebuild_streamed(
+        &self,
+        mut chunks: tokio::sync::mpsc::Receiver<NativeResult<Vec<EmbedInput>>>,
+        total: u64,
+        col_mod: i64,
+        model_id: Option<String>,
+        embedder: &dyn Embedder,
+        images: Option<(&dyn ImageEmbedder, &dyn ImageResolver)>,
+        mode: WriteMode,
+    ) -> NativeResult<()> {
         {
             let mut shared = self.shared.lock().expect("orchestrator poisoned");
             shared.state = OrchestratorState::Building;
@@ -1316,17 +1344,17 @@ impl IndexOrchestrator {
 
         let result: NativeResult<()> = async {
             let mut indexed = 0u64;
-            // The outer chunking exists to land build_progress between
-            // batches (each ≤ BATCH_SIZE slice is a single pass inside
-            // `apply`); `replace = false` skips the per-batch removes that
-            // would otherwise run against the just-cleared index.
-            for batch in inputs.chunks(BATCH_SIZE) {
-                self.apply(batch, embedder, images, false, mode).await?;
-                indexed += batch.len() as u64;
+            while let Some(chunk) = chunks.recv().await {
+                let chunk = chunk?;
+                if chunk.is_empty() {
+                    continue;
+                }
+                self.apply(&chunk, embedder, images, false, mode).await?;
+                indexed += chunk.len() as u64;
                 self.shared
                     .lock()
                     .expect("orchestrator poisoned")
-                    .build_progress = (indexed, total);
+                    .build_progress = (indexed, total.max(indexed));
             }
             {
                 let mut shared = self.shared.lock().expect("orchestrator poisoned");
@@ -1411,52 +1439,114 @@ impl IndexOrchestrator {
         // end-state equals a full rebuild and drift goes quiet correctly.
         // (A first build — stored model_id None — falls through to the
         // empty-prior-state rebuild below; this gate only fires on a real swap.)
+        // A MODEL SWAP must full-rebuild (the per-note hash never folds the
+        // model_id, so a swap yields an empty diff that leaves unchanged notes
+        // in the old space). NO PRIOR STATE likewise rebuilds (nothing to diff).
         let stored_model_id = self.model_id();
-        if stored_model_id.is_some() && stored_model_id != model_id {
+        if (stored_model_id.is_some() && stored_model_id != model_id) || !self.has_hashes() {
             return self
                 .rebuild_with_mode(inputs, col_mod, model_id, embedder, images, mode)
                 .await;
         }
-        let new_hashes: BTreeMap<i64, String> = inputs
-            .iter()
-            .map(|i| (i.note_id, self.hash_for(i, images, mode)))
-            .collect();
-        let Some((to_embed, to_remove)) = self.reconcile_diff(&new_hashes) else {
-            return self
-                .rebuild_with_mode(inputs, col_mod, model_id, embedder, images, mode)
-                .await;
-        };
-        if to_embed.is_empty() && to_remove.is_empty() {
-            // A non-embedding edit bumped col.mod: advance the watermark only.
-            let mut shared = self.shared.lock().expect("orchestrator poisoned");
-            shared.col_mod = Some(col_mod);
-            drop(shared);
-            self.save_meta_only()?;
-            return Ok(());
-        }
+        let total = inputs.len() as u64;
+        let rx = chunk_channel(inputs);
+        self.reconcile_streamed(rx, total, col_mod, model_id, embedder, images, mode)
+            .await
+    }
+
+    /// The streaming reconcile core: diff each chunk against the stored hashes
+    /// as it arrives — embedding only changed/new notes — accumulate the new
+    /// hash map, then remove the notes that vanished (stored, but not read this
+    /// pass). O(chunk) embed memory; the diff baseline + new map are
+    /// O(collection) in small `(id, hash)` pairs only. The caller guarantees
+    /// prior state exists and the model is unchanged (else it rebuilds).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a chunk read, embedding, or an engine write fails (the
+    /// state flips to [`OrchestratorState::Error`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shared-state mutex is poisoned (a prior holder panicked).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reconcile_streamed(
+        &self,
+        mut chunks: tokio::sync::mpsc::Receiver<NativeResult<Vec<EmbedInput>>>,
+        total: u64,
+        col_mod: i64,
+        model_id: Option<String>,
+        embedder: &dyn Embedder,
+        images: Option<(&dyn ImageEmbedder, &dyn ImageResolver)>,
+        mode: WriteMode,
+    ) -> NativeResult<()> {
+        // The diff baseline: a snapshot of the stored per-note hashes (small —
+        // `(id, hash)` pairs). The orchestrator is the sole writer (the actor
+        // task), so nothing mutates it while we stream.
+        let stored: BTreeMap<i64, String> = self
+            .shared
+            .lock()
+            .expect("orchestrator poisoned")
+            .note_hashes
+            .clone()
+            .unwrap_or_default();
         {
             let mut shared = self.shared.lock().expect("orchestrator poisoned");
             shared.state = OrchestratorState::Building;
-            shared.build_progress = (0, to_embed.len() as u64);
+            shared.build_progress = (0, total);
         }
+        let mut new_hashes: BTreeMap<i64, String> = BTreeMap::new();
         let result: NativeResult<()> = async {
+            let mut any_embedded = false;
+            let mut seen = 0u64;
+            while let Some(chunk) = chunks.recv().await {
+                let chunk = chunk?;
+                let n = chunk.len() as u64;
+                // Per-chunk diff: a note is changed iff its new hash differs
+                // from the stored one (or it is new). `apply` (replace=true)
+                // remove-then-adds the changed set; unchanged notes are skipped.
+                let mut changed: Vec<EmbedInput> = Vec::new();
+                for input in chunk {
+                    let h = self.hash_for(&input, images, mode);
+                    let id = input.note_id;
+                    let is_changed = stored.get(&id) != Some(&h);
+                    new_hashes.insert(id, h);
+                    if is_changed {
+                        changed.push(input);
+                    }
+                }
+                if !changed.is_empty() {
+                    self.add_with_mode(&changed, embedder, images, mode).await?;
+                    any_embedded = true;
+                }
+                seen += n;
+                self.shared
+                    .lock()
+                    .expect("orchestrator poisoned")
+                    .build_progress = (seen, total.max(seen));
+            }
+            // Vanished: stored ids absent from what we just read.
+            let to_remove: Vec<i64> = stored
+                .keys()
+                .copied()
+                .filter(|id| !new_hashes.contains_key(id))
+                .collect();
             if !to_remove.is_empty() {
                 self.remove(&to_remove)?;
             }
-            let embed_set: std::collections::HashSet<i64> = to_embed.iter().copied().collect();
-            let changed: Vec<EmbedInput> = inputs
-                .into_iter()
-                .filter(|i| embed_set.contains(&i.note_id))
-                .collect();
-            self.add_with_mode(&changed, embedder, images, mode).await?;
             {
                 let mut shared = self.shared.lock().expect("orchestrator poisoned");
                 shared.note_hashes = Some(new_hashes);
                 shared.col_mod = Some(col_mod);
                 shared.model_id = model_id;
             }
-            self.calibrate_activation()?;
-            self.save()?;
+            if any_embedded || !to_remove.is_empty() {
+                self.calibrate_activation()?;
+                self.save()?;
+            } else {
+                // A non-embedding edit bumped col.mod: advance the watermark only.
+                self.save_meta_only()?;
+            }
             Ok(())
         }
         .await;

@@ -115,22 +115,23 @@ projection. It may lag the collection (stale results) but the collection never l
 comparison plus a background rebuild. Scheme and fingerprint details in
 `indexing-and-search.md`.
 
-### Contextual upsert returns neighbours; it makes no suggestions
+### `upsert_notes` is write-only; neighbours come from the search path
 
-`upsert_notes` returns, per created/updated note, the k nearest existing notes — the same
-fused `search_notes` pipeline over the note's own content, with the batch excluded from
-itself. There's no `neighbor_threshold` (an absolute cosine cutoff doesn't map onto the RRF
-ranking); a holistic gate admits a neighbour only when a real content signal backs it (a
-semantic match clearing the search floor, or an exact overlap). It returns raw neighbours
-and stops — no tag suggestions, no duplicate flags — because the server can't know the
-caller's intent and a baked-in policy would be wrong half the time. The neighbours let an
-LLM caller ground new cards in the existing taxonomy; the policy lives in the skill.
+`upsert_notes` returns per-item `status` + `id` and nothing more — it does not attach the
+written notes' nearest neighbours. The neighbour list was never a read-after-write on the
+index (it embedded each written note's text as a *query* and searched with that note
+excluded), so it was a query-embed plus a search bolted onto every write's response path —
+a multi-second remote-embed N+1 on the latency-sensitive write. The same information is a
+`search_notes` of a card's content, which the caller runs *before* writing (the authoring
+dup-check) or keyed on the id *after* (`search_notes(ids=[…])`) — a read on the search path
+where it belongs, not a cost every write pays. The dedup/activation calibration sampler that
+fed off the neighbour search's scores re-sources to the ordinary search path.
 
 ### Semantic duplicate detection is not a separate feature
 
 There's no dedicated semantic-duplicate endpoint. A high similarity score in `search_notes`
-or upsert neighbours *is* the soft-duplicate signal, and the caller sets its own threshold;
-a second code path with a built-in cutoff would be redundant with a worse interface.
+*is* the soft-duplicate signal, and the caller sets its own threshold; a second code path
+with a built-in cutoff would be redundant with a worse interface.
 
 ### Anki's exact duplicate rule lives inside `upsert_notes`
 
@@ -529,3 +530,46 @@ consumers speak the actions-over-HTTP edge, never MCP.
 - **Accepted cost** — Leptos has no list virtualization, so the collection browser needs a
   hand-rolled windowing component at the 100k-note baseline. Revisit only if `shrike-schemas` stops
   compiling to wasm32, or the component-ecosystem gap proves a sustained drag.
+
+### Read-phase parallelism is foreclosed by anki's exclusive lock (the #853 spike)
+
+The pipeline-sanity epic asked whether the read phase of a bulk op (the 100k boot scan, search
+candidate hydration) could shard across K read connections in parallel, since SQLite WAL supports
+concurrent readers. The spike's answer is **no, definitively** — not because anki lacks a read-only
+handle, but because anki opens the collection with `locking_mode = exclusive` (rslib
+`storage/sqlite.rs`) on top of `journal_mode = wal`. In exclusive locking mode SQLite never releases
+its file lock for the life of the connection, so **no second connection can read the database while
+anki holds it** — WAL's concurrent-reader property does not apply. anki's backend is a single
+exclusive owner by construction (its own single-process model depends on it), and it exposes no
+read-only / second-connection API; the `db_rows` DB-proxy is read-only SQL but still serializes
+through the one backend.
+
+Consequence: the read phase of a bulk op cannot be parallelised without either patching anki to drop
+exclusive locking (which would break its own assumptions) or replicating anki's field/notetype
+decoding against a raw read-only `rusqlite` connection (fragile, and still blocked by the exclusive
+lock while anki is open). Theme B's streamed read — the single `drive_sync` thread, pipelined
+against the embed (`read(k+1) ‖ embed(k)`) — is therefore the read-phase design, and the
+downstream read-parallelism work the spike gated is closed as not-feasible against the current anki.
+
+### One structured-maintenance primitive — but the saver's debounce is not just burst-coalescing (Theme G)
+
+Two background coalescers survived the ingest-actor consolidation (Theme A absorbed the
+derived-claim and recognition-sweep coordinators): the index `DebouncedSaver` and the
+`TagRefresher`. Both are now expressed over one primitive, `maintenance::Maintenance` — a coalescing
+single-flight job with a uniform `request` / coalesce / `cancel` / `shutdown` lifecycle and a single
+status counter (`pending`). The win is uniformity and one place to later hang the deferred #797/#800
+instrumentation, not throughput.
+
+The non-obvious part is *why the primitive carries two pacing knobs rather than one*. The proposal
+framed both jobs as burst-coalescers whose threshold "can be trivial under rare concurrency." That is
+true for the tag refresh (a cheap, pure recompute — `delay = 0`: run immediately, coalesce concurrent
+requests into one re-run paced by `window`). It is **not** true for the index saver. The saver's
+`delay` is a *re-arming time-window debounce*: it batches a stream of **spaced** writes — an
+interactive add-N-notes session, one note every few seconds — into a single large index file write
+per quiet period. Collapsing it to immediate-coalesce would issue one full-index write per note in
+exactly that common case, since spaced requests never overlap a run to coalesce. So `Maintenance`
+keeps both modes: a re-arming `delay` (saver: batch spaced writes), a burst `threshold` (cap a flood
+so it doesn't sit behind the debounce), and a coalesced re-run `window`. `delay = 0, threshold = 0`
+recovers the pure coalesce-loop. The synchronous shutdown write stays the host's own path
+(`DebouncedSaver::flush` calls `cancel` then writes inline), so `close()` returns only after the
+write lands.

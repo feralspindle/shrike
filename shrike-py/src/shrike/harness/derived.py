@@ -30,7 +30,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import sqlite3
-import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -180,22 +179,10 @@ class DerivedTextStore:
         # engine. A *factory*, not an instance: corrupt-file recovery recreates
         # the engine after discarding the file.
         self._engine_factory = engine_factory if engine_factory is not None else NativeDerivedEngine
-        # A short-lived lock for the BUILDING claim only — never held during SQLite I/O,
-        # so a /reload on the event loop can claim/skip a build without waiting on an in-flight
-        # build's data transaction (the engine's internal lock would).
-        self._state_lock = threading.Lock()
         self._engine: NativeDerivedEngine | None = None
         self._available = False
         self._state = IndexState.UNAVAILABLE
         self._col_mod: int | None = None
-        self._build_thread: threading.Thread | None = None
-        # True only while BUILDING was claimed for a build that runs *outside* this store
-        # (the kernel's `rebuild_derived` against its own connection — `claim_external_build`).
-        # In that window this facade's `_engine` is idle and the rows are already committed, so
-        # reads can be served from already-present data; a host-side `build()` keeps it False
-        # because the host engine is then mid-transaction under its own mutex (reads must stay
-        # gated). Read/written only under `_state_lock`, paired with the `_state` transition.
-        self._external_build = False
         self._open()
 
     # ── lifecycle ────────────────────────────────────────────────────────────────────────────────
@@ -278,21 +265,18 @@ class DerivedTextStore:
     def _can_serve_reads(self) -> bool:
         """Whether a *read* (substring/fuzzy) may run against the engine right now.
 
-        Looser than :attr:`available`: it also serves during the **external-build** BUILDING
-        window. There the kernel rebuilds against its OWN connection while this facade's
-        ``_engine`` is idle and the relevant rows are already committed in ``shrike.db`` — so a
-        host read is safe and consistent, and must NOT silently field-fall-back already-present
-        recognition rows during the boot/reload rebuild. A *host-side* ``build()`` stays gated
-        (``_external_build`` False): the host's own engine is then mid ``DELETE``+``INSERT`` under
-        its engine mutex, so a concurrent read would block the event loop on that mutex.
-
-        Writes/drift keep gating on :attr:`available` — this relaxation is read-only.
+        Serving in both READY and BUILDING is safe because the kernel's rebuild is
+        ATOMIC: it builds the new FTS5 index into a shadow off the live tables and swaps it over
+        them in ONE transaction, so any reader sees either the complete OLD index or the complete
+        NEW one — never a torn/partial state mid-rebuild. (The justification is the atomic swap,
+        NOT a journal mode — the store opens ``journal_mode=DELETE``, not WAL.) Production lexical
+        reads run through the kernel's own mutex'd connection, serialized against the swap; this
+        facade's separate connection (the ``/status`` surface) likewise sees only committed state.
+        So a BUILDING read must not silently field-fall-back already-present rows — serve it.
         """
         if not self._available or self._engine is None:
             return False
-        if self._state == IndexState.READY:
-            return True
-        return self._state == IndexState.BUILDING and self._external_build
+        return self._state in (IndexState.READY, IndexState.BUILDING)
 
     @property
     def state(self) -> IndexState:
@@ -332,9 +316,14 @@ class DerivedTextStore:
             logger.warning("Derived-text store count failed: %s", e)
             return 0
 
-    # ── writes ───────────────────────────────────────────────────────────────────────────────────
+    # ── writes (PRIVATE: the low-level engine seam) ────────────────────────────
+    # The KERNEL is the sole production writer of shrike.db — production never
+    # writes through this facade (it drives the kernel's `rebuild_derived` + the
+    # per-op ingest actor), so these are underscore-private: a non-test caller is
+    # a dual-writer/SQLITE_BUSY bug, not a supported path. Tests use them to stage
+    # fixture state for the read-path assertions.
 
-    def ingest(self, note_id: int, source: str, refs_text: Mapping[str, str]) -> None:
+    def _ingest(self, note_id: int, source: str, refs_text: Mapping[str, str]) -> None:
         """Replace a note's text rows for one ``source`` (incremental upsert).
 
         ``refs_text`` maps a ``ref`` (field name, or a media filename for a derived source) to its
@@ -344,13 +333,13 @@ class DerivedTextStore:
             return
         self._engine.ingest(note_id, source, refs_text)
 
-    def remove(self, note_ids: list[int], source: str | None = None) -> None:
+    def _remove(self, note_ids: list[int], source: str | None = None) -> None:
         """Drop notes' rows (all sources, or just one)."""
         if not self._available or self._engine is None or not note_ids:
             return
         self._engine.remove(note_ids, source)
 
-    def build(self, rows: Iterable[tuple[int, str, str, str]], col_mod: int) -> None:
+    def _build(self, rows: Iterable[tuple[int, str, str, str]], col_mod: int) -> None:
         """Full (re)build from ``(note_id, source, ref, text)`` rows; stamps ``col_mod``."""
         if not self._available or self._engine is None:
             return
@@ -372,72 +361,25 @@ class DerivedTextStore:
             raise
 
     def claim_external_build(self) -> bool:
-        """Claim BUILDING for a build that runs OUTSIDE this store (the
-        kernel's `rebuild_derived` op builds against its own engine on the
-        same shrike.db; the rows never enter Python). Same dedupe rule as
-        `build_in_background`: a second drift trigger while one is in flight
-        is a no-op. Returns False when unavailable or already building."""
-        if not self._available:
+        """Mark the store BUILDING for the rebuild that runs in the KERNEL (the
+        sole writer of ``shrike.db``; the rows never enter Python). Dedupe: a
+        second drift trigger while one is in flight is a no-op. Every transition
+        runs on the event loop, so no lock is needed (the host-side build thread
+        that needed one is gone). Returns False when unavailable or already
+        building."""
+        if not self._available or self._state == IndexState.BUILDING:
             return False
-        with self._state_lock:
-            if self._state == IndexState.BUILDING:
-                return False
-            self._state = IndexState.BUILDING
-            # The build runs on the kernel's own connection; this facade's engine stays idle and
-            # the rows are already committed, so reads may be served during this window.
-            self._external_build = True
+        self._state = IndexState.BUILDING
         return True
 
     def settle_external_build(self, col_mod: int | None) -> None:
-        """Record an external build's outcome: READY + the watermark on
+        """Record the kernel rebuild's outcome: READY + the watermark on
         success (``col_mod``), ERROR on ``None``."""
-        with self._state_lock:
-            if col_mod is None:
-                self._state = IndexState.ERROR
-            else:
-                self._col_mod = col_mod
-                self._state = IndexState.READY
-            self._external_build = False
-
-    def build_in_background(self, rows: Iterable[tuple[int, str, str, str]], col_mod: int) -> None:
-        """Run :meth:`build` on a daemon thread (``rows`` are materialized first — they cross)."""
-        if not self._available:
-            return
-        # Claim BUILDING *before* spawning, so two drift triggers firing close together (boot vs an
-        # immediate /reload, a cooperative re-acquire) don't both run a full rebuild — build() flips
-        # BUILDING only once its worker runs, too late. The claim uses the short-lived _state_lock
-        # (NOT the SQLite-access lock), so a /reload on the event loop never waits here on an
-        # in-flight build's transaction.
-        with self._state_lock:
-            if self._state == IndexState.BUILDING:
-                return
-            self._state = IndexState.BUILDING
-        materialized = list(rows)
-
-        def _release_stuck_claim() -> None:
-            # If the claim never reached a terminal state (build() early-returned on a closed store,
-            # or the thread never started), don't strand the store in BUILDING — that would refuse
-            # every future build and read.
-            with self._state_lock:
-                if self._state == IndexState.BUILDING:
-                    self._state = self._idle_state()
-
-        def _run() -> None:
-            try:
-                self.build(materialized, col_mod)  # records its own terminal READY/ERROR state
-            except Exception:
-                logger.debug("background derived build failed", exc_info=True)
-            finally:
-                _release_stuck_claim()
-
-        try:
-            self._build_thread = threading.Thread(target=_run, name="derived-build", daemon=True)
-            self._build_thread.start()
-        except Exception:
-            _release_stuck_claim()  # thread couldn't start — release so a later trigger can retry
-            logger.warning("Could not start background derived build", exc_info=True)
-            return
-        logger.info("Background derived-text build started (%d rows)", len(materialized))
+        if col_mod is None:
+            self._state = IndexState.ERROR
+        else:
+            self._col_mod = col_mod
+            self._state = IndexState.READY
 
     def check_drift(self, current_col_mod: int) -> bool:
         """True when the store is stale (never built, or ``col_mod`` moved) → needs a rebuild."""

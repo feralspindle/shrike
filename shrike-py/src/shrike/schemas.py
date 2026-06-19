@@ -253,24 +253,6 @@ class SearchMatch(Note):
     provenance: list[SignalContribution] = []
 
 
-class Neighbor(BaseModel):
-    """A similar-note candidate attached to an upsert result.
-
-    Neighbors are search results: a created/updated note's neighbors are a
-    ``search_notes`` of its own content, so a neighbor carries the same shape
-    a search match does. ``score`` is the cosine similarity when the candidate
-    was semantically ranked — ``None`` for an exact-text-only hit (which has no
-    meaningful cosine to report). ``provenance`` says which signals surfaced it,
-    in the same ``{signal, rank}`` shape as search provenance — ANY search
-    signal (``text``, ``exact``, ``image``, ``tag``, ``fuzzy``), not just text.
-    """
-
-    id: int
-    score: float | None = None
-    tags: list[str] = []
-    provenance: list[SignalContribution] = []
-
-
 class TemplateInfo(BaseModel):
     name: str
     front: str
@@ -365,8 +347,6 @@ NoteValidationReason = Literal[
 class UpsertNoteOk(BaseModel):
     status: Literal["created", "updated"]
     id: int
-    neighbors: list[Neighbor] = []
-    neighbors_unavailable: bool = False
 
 
 class UpsertNoteValidated(BaseModel):
@@ -642,7 +622,7 @@ DeleteNoteTypeResult = Annotated[
 #
 # No ``error`` field: a whole-call failure (bad input, unhandled exception) is
 # an MCP ``isError`` result, which the client raises on. ``message`` is a
-# genuine optional advisory (e.g. index-building notice, neighbor-retry hint).
+# genuine optional advisory (e.g. an index-building notice).
 # ============================================================================
 
 
@@ -1087,8 +1067,8 @@ class CoverageMatrix(BaseModel):
 
 
 class DedupStats(BaseModel):
-    """Rolling dedup best-match statistics: one sample per upsert draft
-    note — the best SEMANTIC neighbor cosine, or a `no_match` tick when none
+    """Rolling dedup best-match statistics: one sample per search query group —
+    the best SEMANTIC cosine among its matches, or a `no_match` tick when none
     ranked. The calibration feedstock for the dedup threshold, deliberately
     separate from the search-gate calibration (different population).
     `buckets[i]` counts best-scores in [i/20, (i+1)/20); 20 buckets over [0, 1].
@@ -1168,8 +1148,9 @@ class ServerStatus(BaseModel):
     # (and the permanent-mode common case) validate.
     locking: Literal["permanent", "cooperative"] = "permanent"
     collection_held: bool = True
-    # Dedup best-match statistics — None until the first upsert with
-    # neighbors runs (and on payloads from older servers).
+    # Dedup/activation best-match statistics — None until the first search
+    # records a sample (and on payloads from older servers). The sampler rides
+    # the search path, not the upsert response.
     dedup: DedupStats | None = None
     # Per-engine recognition state: a map keyed by source
     # (``ocr``/``vlm``), each row {state, backend, fingerprint}. An EMPTY map

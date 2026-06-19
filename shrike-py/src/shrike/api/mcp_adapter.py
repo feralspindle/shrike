@@ -14,20 +14,49 @@ bind the same actions without touching this module.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import shrike_native
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.tools.base import Tool
 
-from shrike.api.actions import ActionDef, ToolInputError, _call_outcome
+from shrike.api.actions import (
+    CONTROL_PLANE_ACTIONS,
+    ActionDef,
+    ToolInputError,
+    _call_outcome,
+)
 from shrike.harness.collection import CollectionBusyError
 
 logger = logging.getLogger("shrike.tools")
+
+# The readiness gate: an async callable that resolves once the data plane is
+# open (boot/reload/re-acquire maintenance has settled). None disables gating
+# (standalone / tests with no harness barrier).
+ReadinessGate = Callable[[], Awaitable[None]]
+
+# A DEFENSIVE bound on the readiness wait: await_ready is deterministic-and-
+# bounded today (boot/reload/re-acquire settle in seconds), but the gate must
+# fail SAFE — a future readiness regression must surface a clear, loud error
+# rather than wedging every data-plane call forever. Generous, so a normal slow
+# settle (a large derived rebuild) never trips it.
+READINESS_GATE_TIMEOUT_S = 30.0
+
+
+class ServerNotReadyError(RuntimeError):
+    """The data plane did not become ready within the gate's defensive bound.
+
+    Raised only when [`READINESS_GATE_TIMEOUT_S`] elapses awaiting the readiness
+    barrier — a sign the server is wedged settling (a regression or extreme
+    load), not the normal park-until-ready path. Surfaced loudly (an MCP
+    ``isError``) so the condition is visible, never silently retried."""
+
 
 # Cap on a single rendered param value in the completion line (long field
 # bodies and queries get elided, never dropped).
@@ -137,24 +166,68 @@ def _safe_tool(fn: Any) -> Any:
     return wrapper
 
 
-def register_actions(mcp: FastMCP, actions: list[ActionDef]) -> None:
+def _gate_ready(impl: Any, readiness: ReadinessGate | None) -> Any:
+    """Wrap a data-plane action impl so it AWAITS data-plane readiness before
+    running (Theme C / #833: serve only ``/status`` + the control plane until
+    boot/reload/re-acquire maintenance has settled). Every action is data-plane,
+    so the gate is uniform; the control plane (``/status``/``/reload``/
+    ``/shutdown``/``/embedding/*``) is the operational HTTP routes, which never
+    reach here. ``None`` (standalone / tests) is a pass-through.
+
+    The wrapper preserves the impl's signature (``functools.wraps``) so FastMCP's
+    ``func_metadata`` still generates the right input schema, and it sits BENEATH
+    ``_safe_tool`` so the await is inside the one-INFO-line/error-policy frame.
+
+    The wait carries a DEFENSIVE timeout ([`READINESS_GATE_TIMEOUT_S`]): the
+    normal path parks until ready, but a wedged barrier surfaces a clear
+    [`ServerNotReadyError`] instead of hanging the call forever.
+    """
+    if readiness is None:
+        return impl
+
+    @functools.wraps(impl)
+    async def gated(*args: Any, **kwargs: Any) -> Any:
+        try:
+            await asyncio.wait_for(readiness(), timeout=READINESS_GATE_TIMEOUT_S)
+        except TimeoutError as e:
+            raise ServerNotReadyError(
+                f"the data plane did not become ready within {READINESS_GATE_TIMEOUT_S:.0f}s"
+            ) from e
+        return await impl(*args, **kwargs)
+
+    return gated
+
+
+def _bound_impl(action: ActionDef, readiness: ReadinessGate | None) -> Any:
+    """The wrapped impl both edges bind: ``_safe_tool`` over the readiness gate,
+    EXCEPT for a control-plane action (in [`CONTROL_PLANE_ACTIONS`]), which
+    bypasses the gate so it can serve before the data plane is ready."""
+    gate = None if action.name in CONTROL_PLANE_ACTIONS else readiness
+    return _safe_tool(_gate_ready(action.impl, gate))
+
+
+def register_actions(
+    mcp: FastMCP, actions: list[ActionDef], readiness: ReadinessGate | None = None
+) -> None:
     """Bind every registry action as an MCP tool (the decoration order:
-    ``mcp.tool()`` over the ``_safe_tool``-wrapped impl)."""
+    ``mcp.tool()`` over the ``_safe_tool``-wrapped, readiness-gated impl)."""
     for action in actions:
-        mcp.tool()(_safe_tool(action.impl))
+        mcp.tool()(_bound_impl(action, readiness))
 
 
-def build_action_tools(actions: list[ActionDef]) -> dict[str, Tool]:
+def build_action_tools(
+    actions: list[ActionDef], readiness: ReadinessGate | None = None
+) -> dict[str, Tool]:
     """Build a ``name -> Tool`` map for the actions-over-HTTP edge.
 
     Strict parity by construction: each ``Tool`` is built from the *exact same*
-    ``_safe_tool``-wrapped impl that :func:`register_actions` binds to MCP
-    (``mcp.tool()`` calls ``Tool.from_function`` on the same wrapped callable).
-    So the UI edge inherits the identical ``arg_model`` (func_metadata's
+    ``_safe_tool``-wrapped, readiness-gated impl that :func:`register_actions`
+    binds to MCP (``mcp.tool()`` calls ``Tool.from_function`` on the same wrapped
+    callable). So the UI edge inherits the identical ``arg_model`` (func_metadata's
     JSON→typed coercion + ``pre_parse_json``), the same ``_safe_tool`` error
-    policy + one-INFO-line logging, and the same ``output_model`` — the
-    structured payload it serializes is byte-identical to the ``structuredContent``
-    the MCP path emits, minus the JSON-RPC envelope. MCP is the agent edge;
-    these tools are the UI edge; same catalog, two adapters.
+    policy + one-INFO-line logging, the same readiness gate, and the same
+    ``output_model`` — the structured payload it serializes is byte-identical to
+    the ``structuredContent`` the MCP path emits, minus the JSON-RPC envelope.
+    MCP is the agent edge; these tools are the UI edge; same catalog, two adapters.
     """
-    return {action.name: Tool.from_function(_safe_tool(action.impl)) for action in actions}
+    return {action.name: Tool.from_function(_bound_impl(action, readiness)) for action in actions}

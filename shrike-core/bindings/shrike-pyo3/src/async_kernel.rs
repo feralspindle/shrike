@@ -348,6 +348,24 @@ impl AsyncKernel {
         })
     }
 
+    /// Drive recognition sweeps to quiescence INSIDE the kernel — awaitable. One
+    /// FFI crossing instead of one per batch: the while-loop (drained /
+    /// no-progress / `max_batches`) runs in Rust. Returns the final JSON report
+    /// (`{status, recognized, stored, remaining, total_stored, batches}`).
+    /// `max_batches=None` runs until drained or a no-progress batch.
+    fn recognize_all_pending<'py>(
+        &self,
+        py: Python<'py>,
+        max_items: usize,
+        max_batches: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        kernel_op(py, async move {
+            let report = inner.recognize_all_pending(max_items, max_batches).await?;
+            Ok::<_, shrike_error::NativeError>(report.to_json().to_string())
+        })
+    }
+
     /// Create a batch of notes (the duplicate policy per item) and index
     /// them — ONE collection job, ONE read job, batched embeds (an awaitable;
     /// per-item results, one bad note never sinks the batch).
@@ -927,6 +945,19 @@ impl AsyncKernel {
         kernel_op(py, async move { kernel.reindex_if_needed().await })
     }
 
+    /// Await the ingest queue drained to the current point — awaitable. Every
+    /// maintenance item enqueued before this call has been fully processed
+    /// (re-read → embed → index/derived add → watermark advance), so the effects
+    /// of all prior writes are visible. The deterministic barrier the data plane
+    /// and tests await instead of polling the index/derived status.
+    fn settle<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let kernel = Arc::clone(&self.inner);
+        kernel_op(py, async move {
+            kernel.settle().await;
+            Ok::<(), shrike_error::NativeError>(())
+        })
+    }
+
     /// Cross-space search inputs as JSON — awaitable. Embeds the query
     /// texts into every SECONDARY text-capable space (on the kernel runtime,
     /// where embed is legal — `action_search_notes` runs on the collection-actor
@@ -975,6 +1006,12 @@ impl AsyncKernel {
     /// The index status block as JSON (state/size/progress/stamps).
     fn index_status_json(&self) -> PyResult<String> {
         crate::kernel_actions::wire(&self.inner.index().status()).map_err(crate::to_py_err)
+    }
+
+    /// How many ingest-drain items/jobs the sole writer caught panicking — the
+    /// `/status` degraded-writer signal (0 in normal operation).
+    fn ingest_drain_panics(&self) -> u64 {
+        self.inner.ingest_drain_panics()
     }
 
     /// Flush the index + sidecars now (shutdown path).
