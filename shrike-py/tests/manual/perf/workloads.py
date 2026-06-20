@@ -45,13 +45,16 @@ from __future__ import annotations
 import random
 
 from shrike.schemas import NoteInput
-from tests.manual.perf.corpus import VOCAB
+from tests.manual.perf.corpus import choose, n_topics
 from tests.manual.perf.driver import Booted, Workload
 
 
-def _query(rng: random.Random) -> str:
-    """A short synthetic query: 1-4 vocabulary terms."""
-    return " ".join(rng.choice(VOCAB) for _ in range(rng.randint(1, 4)))
+def _query(rng: random.Random, topics: int) -> str:
+    """A short synthetic query: 1-4 terms drawn from one random deck's vocabulary,
+    so it hits that deck (common terms in the draw still match broadly across decks,
+    domain terms match ~that one) — the realistic mix a real search produces."""
+    topic = rng.randrange(topics)
+    return " ".join(choose(rng, rng.randint(1, 4), topic))
 
 
 #: N — the operations each data-plane workload performs per timed iteration: the
@@ -76,16 +79,19 @@ class _SearchWorkload:
 
     mutates = False
 
-    def __init__(self, *, count: int = DEFAULT_OPS, limit: int = 20) -> None:
+    def __init__(self, *, count: int = DEFAULT_OPS, limit: int = 20, corpus_size: int = 0) -> None:
         self._count = count
         self._limit = limit
+        self._topics = n_topics(corpus_size)
         self._batches: list[list[str]] = []
 
     async def setup(self, booted: Booted, iterations: int) -> None:
         # Precompute every iteration's queries (untimed) so the string formatting
         # never lands in the timed region.
         rng = random.Random(0x5EED)
-        self._batches = [[_query(rng) for _ in range(self._count)] for _ in range(iterations)]
+        self._batches = [
+            [_query(rng, self._topics) for _ in range(self._count)] for _ in range(iterations)
+        ]
 
     async def _search(self, booted: Booted, queries: list[str]) -> None:
         await booted.call(
@@ -125,7 +131,7 @@ class RebuildWorkload:
     name = "rebuild"
     mutates = False
 
-    def __init__(self, *, count: int = DEFAULT_OPS) -> None:
+    def __init__(self, *, count: int = DEFAULT_OPS, corpus_size: int = 0) -> None:
         # A rebuild is one O(collection) pass; the per-op N (``--ops``) doesn't
         # apply. The uniform ``count`` keyword lets the runner build every workload
         # identically — here it's accepted and discarded.
@@ -143,7 +149,7 @@ def _upsert_note(iteration: int, j: int) -> NoteInput:
     # A fresh deck/tag so upserted notes never collide with the corpus; the text
     # is deterministic per (iteration, j) and the front is globally unique.
     rng = random.Random((iteration << 20) ^ j)
-    body = " ".join(rng.choice(VOCAB) for _ in range(12))
+    body = " ".join(choose(rng, 12))
     return NoteInput(
         deck="Perf::Upsert",
         note_type="Basic",
@@ -166,7 +172,7 @@ class _UpsertWorkload:
 
     mutates = True
 
-    def __init__(self, *, count: int = DEFAULT_OPS) -> None:
+    def __init__(self, *, count: int = DEFAULT_OPS, corpus_size: int = 0) -> None:
         self._count = count
         self._batches: list[list[NoteInput]] = []
 
@@ -211,7 +217,7 @@ def _delete_note(j: int) -> NoteInput:
         deck="Perf::Delete",
         note_type="Basic",
         tags=["perf-delete"],
-        fields={"Front": f"delete {j}", "Back": " ".join(rng.choice(VOCAB) for _ in range(8))},
+        fields={"Front": f"delete {j}", "Back": " ".join(choose(rng, 8))},
     )
 
 
@@ -225,7 +231,7 @@ class _DeleteWorkload:
 
     mutates = True
 
-    def __init__(self, *, count: int = DEFAULT_OPS) -> None:
+    def __init__(self, *, count: int = DEFAULT_OPS, corpus_size: int = 0) -> None:
         self._count = count
         self._ids: list[int] = []
 
@@ -274,7 +280,7 @@ def _reconcile_note(iteration: int, j: int) -> dict:
     # A fresh note in its own deck/tag, deterministic per (iteration, j), so each
     # iteration drifts a disjoint set the reconcile sees as new.
     rng = random.Random((iteration << 24) ^ (j ^ 0x5EC0))
-    body = " ".join(rng.choice(VOCAB) for _ in range(12))
+    body = " ".join(choose(rng, 12))
     return {
         "deck": "Perf::Reconcile",
         "note_type": "Basic",
@@ -306,7 +312,7 @@ class ReconcileWorkload:
     name = "reconcile"
     mutates = True
 
-    def __init__(self, *, count: int = DEFAULT_OPS) -> None:
+    def __init__(self, *, count: int = DEFAULT_OPS, corpus_size: int = 0) -> None:
         self._count = count
         self._batches: list[list[dict]] = []
 
@@ -347,9 +353,9 @@ WORKLOADS = {
 }
 
 
-def build_workload(name: str, *, ops: int = DEFAULT_OPS) -> Workload:
+def build_workload(name: str, *, ops: int = DEFAULT_OPS, corpus_size: int = 0) -> Workload:
     """Instantiate workload ``name`` with ``ops`` operations per iteration — the N
-    the runner scales via ``--ops``. Every workload takes the same ``count``
-    keyword; ``rebuild`` is the exception that ignores it (one O(collection) pass,
-    no per-op N)."""
-    return WORKLOADS[name](count=ops)
+    the runner scales via ``--ops``. ``corpus_size`` lets the search workload size
+    its query topics to the corpus (one deck per ~500 notes); the other workloads
+    accept and ignore it (uniform construction, like ``count`` for ``rebuild``)."""
+    return WORKLOADS[name](count=ops, corpus_size=corpus_size)
