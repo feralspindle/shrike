@@ -383,11 +383,16 @@ fn escape_anki_text(text: &str) -> String {
 /// `None` content (a meta-mode note dict carries no fields) yields `None`, the
 /// "no literal match" answer.
 pub fn substring_info(content: Option<&NoteContent>, text: &str) -> Option<SubstringInfo> {
-    let needle: Vec<char> = text.to_lowercase().chars().collect();
+    // NFC-normalize BOTH the needle and the field content, so confirmation is
+    // canonical-form-agnostic regardless of Anki's `NormalizeNoteText` config (when
+    // it's off, fields stay NFD; normalizing only the needle would then reject a
+    // match). The snippet slices the normalized field, so its indices stay aligned.
+    let needle: Vec<char> = shrike_derived::nfc(text).to_lowercase().chars().collect();
     let mut matched: Vec<String> = Vec::new();
     let mut snippet: Option<String> = None;
     let fields = content?;
     for (name, value) in fields {
+        let value = shrike_derived::nfc(value);
         let chars: Vec<char> = value.chars().collect();
         let lowered: Vec<char> = value.to_lowercase().chars().collect();
         let idx = match find_subsequence(&lowered, &needle) {
@@ -398,8 +403,8 @@ pub fn substring_info(content: Option<&NoteContent>, text: &str) -> Option<Subst
         if snippet.is_none() {
             let start = idx.saturating_sub(30);
             let end = (idx + needle.len() + 30).min(chars.len());
-            // Python slices the ORIGINAL with lowered-string indices; on
-            // length-changing lowercasings the window drifts identically.
+            // `chars` and `lowered` derive from the SAME normalized value, so a
+            // length-changing lowercasing drifts both identically and indices align.
             let end = end.min(chars.len());
             let mut frag: String = chars[start.min(chars.len())..end].iter().collect();
             if start > 0 {
@@ -2032,6 +2037,33 @@ mod search_tests {
         assert!(substring_info(Some(&content), "absent").is_none());
         // Absent content (a meta-mode note dict carries no fields) is no match.
         assert!(substring_info(None, "x").is_none());
+    }
+
+    #[test]
+    fn substring_info_normalizes_both_needle_and_field() {
+        // Confirmation is canonical-form-agnostic on BOTH sides, so it holds
+        // regardless of Anki's NormalizeNoteText config.
+        let nfd_needle = "cafe\u{0301}"; // c a f e + combining acute
+        let nfc_needle = "café"; // precomposed é (U+00E9)
+                                 // (a) NFC field (NormalizeNoteText on), NFD query.
+        let nfc_field: NoteContent =
+            BTreeMap::from([("Front".to_owned(), "le café du coin".to_owned())]);
+        assert_eq!(
+            substring_info(Some(&nfc_field), nfd_needle)
+                .expect("NFD needle confirms NFC field")
+                .matched_fields,
+            vec!["Front".to_owned()]
+        );
+        // (b) NFD field (NormalizeNoteText off), NFC query — the field is
+        // normalized too, so it still confirms (would regress if only the needle were).
+        let nfd_field: NoteContent =
+            BTreeMap::from([("Front".to_owned(), "le cafe\u{0301} du coin".to_owned())]);
+        assert_eq!(
+            substring_info(Some(&nfd_field), nfc_needle)
+                .expect("NFC needle confirms NFD field")
+                .matched_fields,
+            vec!["Front".to_owned()]
+        );
     }
 
     // ── Cross-space fusion + the relative activation gate ────────────────────
