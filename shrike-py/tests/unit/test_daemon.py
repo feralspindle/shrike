@@ -1,11 +1,16 @@
-"""Unit tests for daemon.stop_server's HTTP → SIGTERM → SIGKILL escalation.
+"""Unit tests for the daemon helpers.
 
-These cover the three-tier shutdown ladder by patching the side-effecting
-helpers, so no real process is spawned or signalled.
+``TestStopServerEscalation``/``TestStopServerNotRunning`` cover the three-tier
+HTTP → SIGTERM → SIGKILL shutdown ladder by patching the side-effecting helpers,
+so no real process is spawned or signalled. ``TestControlSocketPath`` covers the
+runtime-dir selection and its ``$XDG_RUNTIME_DIR`` hardening.
 """
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -128,3 +133,61 @@ class TestStopServerNotRunning:
         assert result["stopped"] is False
         assert "stale state" in result["reason"]
         assert calls["cleanup"] == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="control socket is POSIX-only")
+class TestControlSocketPath:
+    def test_trusts_private_xdg_runtime_dir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        xdg = tmp_path / "run"
+        xdg.mkdir(mode=0o700)
+        os.chmod(xdg, 0o700)  # mkdir mode is masked by umask
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+
+        sock = daemon.control_socket_path(tmp_path / "state")
+
+        assert sock.parent == xdg
+        assert sock.name.startswith("shrike-") and sock.suffix == ".sock"
+
+    def test_falls_back_when_xdg_is_world_traversable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        xdg = tmp_path / "loose"
+        xdg.mkdir()
+        os.chmod(xdg, 0o755)  # not the 0700 the XDG spec mandates
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+
+        sock = daemon.control_socket_path(tmp_path / "state")
+
+        assert sock.parent != xdg
+        assert sock.parent == Path("/tmp") / f"shrike-{os.getuid()}"
+
+    def test_falls_back_when_xdg_is_symlink(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        real = tmp_path / "real"
+        real.mkdir(mode=0o700)
+        os.chmod(real, 0o700)
+        link = tmp_path / "link"
+        link.symlink_to(real)
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(link))
+
+        sock = daemon.control_socket_path(tmp_path / "state")
+
+        assert sock.parent == Path("/tmp") / f"shrike-{os.getuid()}"
+
+    def test_name_is_deterministic_per_state_dir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        xdg = tmp_path / "run"
+        xdg.mkdir(mode=0o700)
+        os.chmod(xdg, 0o700)
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+
+        a = daemon.control_socket_path(tmp_path / "state")
+        b = daemon.control_socket_path(tmp_path / "state")
+        c = daemon.control_socket_path(tmp_path / "other")
+
+        assert a == b
+        assert a.name != c.name

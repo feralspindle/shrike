@@ -53,6 +53,26 @@ def _meta_file(sd: Path) -> Path:
     return sd / "server.json"
 
 
+def _is_private_runtime_dir(path: Path) -> bool:
+    """True iff ``path`` is a real directory (not a symlink) owned by us at 0700.
+
+    The gate for trusting ``$XDG_RUNTIME_DIR``: the spec mandates a user-private
+    0700 dir, but a misconfigured or attacker-influenced value could point at a
+    world-traversable path. On macOS AF_UNIX connect authorization is by directory
+    perms, so a loose dir would make even the pre-chmod window reachable. ``lstat``
+    (not ``os.path.isdir``, which follows symlinks) rejects a symlinked value.
+    """
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == os.getuid()
+        and stat.S_IMODE(info.st_mode) == 0o700
+    )
+
+
 def control_socket_path(sd: Path) -> Path:
     """The control-plane Unix socket path for a daemon rooted at state dir ``sd``.
 
@@ -66,7 +86,7 @@ def control_socket_path(sd: Path) -> Path:
     for client discovery. POSIX only — Windows uses a loopback-TCP control plane.
     """
     xdg = os.environ.get("XDG_RUNTIME_DIR")
-    if xdg and os.path.isdir(xdg):
+    if xdg and _is_private_runtime_dir(Path(xdg)):
         runtime = Path(xdg)  # short and user-private (0700) by the XDG spec
     else:
         runtime = Path("/tmp") / f"shrike-{os.getuid()}"
