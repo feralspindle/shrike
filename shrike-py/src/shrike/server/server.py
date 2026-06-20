@@ -307,9 +307,11 @@ class _ControlListener:
     """Where the privileged control plane listens — always local, never widened
     by ``--allow-remote``.
 
-    A Unix-domain socket on POSIX (``<state_dir>/control.sock``, filesystem-gated,
-    off the network entirely); a loopback-only TCP port on Windows, where asyncio
-    has no Unix-socket support. The address is recorded in ``server.json`` so the
+    A Unix-domain socket on POSIX (filesystem-gated, off the network entirely),
+    living in a short user-private runtime dir — ``$XDG_RUNTIME_DIR`` or a ``0700``
+    ``/tmp/shrike-<uid>``, NOT the state dir, whose path could overflow the AF_UNIX
+    length limit; a loopback-only TCP port on Windows, where asyncio has no
+    Unix-socket support. The address is recorded in ``server.json`` so the
     CLI/client can reach it; the data plane's exposure flags never touch this
     listener.
     """
