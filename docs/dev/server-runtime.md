@@ -66,8 +66,14 @@ The server runs **two listeners**. The **data plane** (the FastMCP app) serves
 **control plane** is a separate Starlette app serving the privileged routes —
 `/shutdown`, `/reload`, `/index/*`, `/embedding/*`, and the full `/status`
 diagnostics — on its own **always-local** listener: a Unix-domain socket
-(`<state_dir>/control.sock`, POSIX) or an ephemeral loopback-TCP port (Windows,
-which lacks asyncio Unix sockets). The control plane **never** honors
+(POSIX) or an ephemeral loopback-TCP port (Windows, which lacks asyncio Unix
+sockets). The socket does **not** live in the state dir — a deep state-dir path
+would overflow the AF_UNIX path-length limit (~104 bytes on macOS). It sits in a
+short, user-private runtime dir (`$XDG_RUNTIME_DIR` when set, else a `0700`
+per-uid `/tmp/shrike-<uid>`), named `shrike-<digest>.sock` where the digest is
+derived from the state dir. That `0700` dir is the real connect gate (the daemon's
+uid owns it); the socket itself is chmod'd `0600` as belt-and-suspenders. The
+control plane **never** honors
 `--allow-remote`/`--allowed-host`/`--no-dns-rebinding-protection`, so the
 privileged surface is unreachable from the network no matter how the data plane is
 exposed. Its address is recorded in `server.json`; the CLI/client discover it
@@ -155,9 +161,12 @@ Each custom route sits behind its plane's `_guard` check.
 lifecycle. It is a control endpoint, not an MCP tool.
 
 State files live in the platform state directory: `server.lock` (the exclusive
-lock), `server.pid` (diagnostics only, not liveness), `server.json` (the data URL
-+ port, the `control` channel address, collection path, start time, log dir), and
-— on POSIX — `control.sock` (the control-plane Unix socket, owner-only).
+lock), `server.pid` (diagnostics only, not liveness), and `server.json` (the data
+URL + port, the `control` channel address, collection path, start time, log dir).
+The POSIX control socket is the exception — it lives **outside** the state dir, in
+the user-private runtime dir (`$XDG_RUNTIME_DIR` or `0700` `/tmp/shrike-<uid>`),
+because a deep state-dir path would overflow the AF_UNIX path-length limit; its
+absolute path is recorded in `server.json` for discovery (Windows has none).
 
 ## Platform directories
 
