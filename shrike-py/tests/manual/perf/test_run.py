@@ -6,6 +6,7 @@ lane — off the per-PR critical path (it boots a kernel + driver threads)."""
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from tests.manual.perf.workloads import (
     SearchSeqWorkload,
     UpsertBatchWorkload,
     UpsertSeqWorkload,
+    build_workload,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -68,12 +70,14 @@ def test_search_batch_produces_a_response_only_distribution(_driven, tmp_path):
     assert res.distribution.n == 2  # the post-warmup repeats
     assert res.distribution.p50_ms >= 0.0
     assert set(res.phases) == {"response"}  # a read path has no settle phase
+    assert res.items == 4  # queries issued (work done), not matches returned
 
 
 def test_search_seq_issues_one_call_per_query(_driven, tmp_path):
     res = run_async(_measure(tmp_path, SearchSeqWorkload(count=4, limit=5), repeats=2, warmup=0))
     assert res.workload == "search-seq"
     assert res.distribution.n == 2
+    assert res.items == 4  # one query per call, count calls -> count queries
 
 
 def test_rebuild_workload_runs(_driven, tmp_path):
@@ -116,9 +120,9 @@ def test_delete_seq_deletes_one_id_per_call(_driven, tmp_path):
 
 
 def test_reconcile_workload_recovers_out_of_band_drift(_driven, tmp_path):
-    # prepare() drifts `drift` notes out-of-band each iteration; the timed run_one
-    # reconciles. Two timed iterations -> two reconciles, each over `drift` notes.
-    res = run_async(_measure(tmp_path, ReconcileWorkload(drift=6), repeats=2, warmup=0))
+    # prepare() drifts `count` notes out-of-band each iteration; the timed run_one
+    # reconciles. Two timed iterations -> two reconciles, each over `count` notes.
+    res = run_async(_measure(tmp_path, ReconcileWorkload(count=6), repeats=2, warmup=0))
     assert res.workload == "reconcile"
     assert res.distribution.n == 2
     assert res.items == 6
@@ -133,3 +137,42 @@ def test_ingest_workload_imports_a_cold_package(_driven, tmp_path):
     assert res.workload == "ingest"
     assert res.distribution.n == 2
     assert res.items == 12  # all 12 notes imported as new
+
+
+def test_build_workload_scales_ops_uniformly_excepting_rebuild() -> None:
+    # --ops N is applied uniformly as each workload's per-iteration count.
+    for name in ("search-batch", "search-seq", "upsert-batch", "delete-seq", "reconcile"):
+        assert getattr(build_workload(name, ops=7), "_count") == 7  # noqa: B009
+    # rebuild is the exception — an O(collection) pass with no per-op N.
+    assert build_workload("rebuild", ops=7).name == "rebuild"
+
+
+def _profile_args(**overrides: object) -> argparse.Namespace:
+    base: dict[str, object] = {"profile": None, "profile_path": None}
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_resolve_profile_path_requires_exactly_one_selector() -> None:
+    from tests.manual.perf.run import _resolve_profile_path
+
+    parser = argparse.ArgumentParser()
+    # parser.error exits the process; neither and both selectors are rejected.
+    with pytest.raises(SystemExit):
+        _resolve_profile_path(_profile_args(), parser)
+    with pytest.raises(SystemExit):
+        _resolve_profile_path(_profile_args(profile="stub", profile_path=Path("/x.yml")), parser)
+    with pytest.raises(SystemExit):
+        _resolve_profile_path(_profile_args(profile_path=Path("/no/such/profile.yml")), parser)
+    # A built-in resolves to its checked-in YAML; the stem is the run/condition label.
+    resolved = _resolve_profile_path(_profile_args(profile="stub"), parser)
+    assert resolved.is_file()
+    assert resolved.stem == "perf-stub"
+
+
+def test_uses_synthetic_reads_the_profile_embedders() -> None:
+    from tests.manual.perf.run import _uses_synthetic
+
+    profiles = Path(__file__).resolve().parent / "profiles"
+    assert _uses_synthetic(profiles / "perf-stub.yml") is True
+    assert _uses_synthetic(profiles / "perf-real.yml") is False
