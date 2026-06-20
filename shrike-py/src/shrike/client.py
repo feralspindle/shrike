@@ -935,11 +935,13 @@ class ShrikeClient:
 
     def is_alive(self) -> bool:
         """True if a local daemon currently holds the server lock."""
-        return daemon.is_server_alive()
+        return daemon.is_server_alive(self._control_state_dir)
 
     def stop(self, timeout: float = 5.0) -> StopResponse:
         """Stop the local daemon (HTTP → SIGTERM → SIGKILL). Delegates to daemon."""
-        return _STOP_ADAPTER.validate_python(daemon.stop_server(timeout=timeout))
+        return _STOP_ADAPTER.validate_python(
+            daemon.stop_server(timeout=timeout, sd=self._control_state_dir)
+        )
 
     def wait_until_ready(self, timeout: float = 15.0) -> ServerStatus | None:
         """Poll ``/status`` until the daemon responds. Returns status or None."""
@@ -957,15 +959,16 @@ class ShrikeClient:
         Raises ServerStartError if the daemon exits before becoming ready.
         """
         self.url = spec.url
-        if daemon.is_server_alive():
-            meta = daemon.read_server_meta()
+        sd = self._control_state_dir
+        if daemon.is_server_alive(sd):
+            meta = daemon.read_server_meta(sd)
             self._autostarted = True
             if meta and meta.get("url"):
                 self.url = str(meta["url"])
             return self.url
 
         # Clean up any stale state from a crashed server before spawning.
-        daemon.cleanup_state()
+        daemon.cleanup_state(sd)
 
         proc = self._spawn(spec)
         self._autostarted = True

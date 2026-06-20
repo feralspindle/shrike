@@ -95,8 +95,8 @@ class ShrikeGroup(OrderedGroup):
     help=(
         "State directory of the target daemon (where it wrote server.json). Only "
         "needed when the daemon runs with a non-default --state-dir; the privileged "
-        "control routes (status/stop/embedding/index) are discovered there. "
-        "[env: SHRIKE_STATE_DIR]"
+        "control routes (status/stop/embedding/index) are discovered there, and an "
+        "auto-started daemon is spawned there too. [env: SHRIKE_STATE_DIR]"
     ),
 )
 @click.option(
@@ -165,6 +165,13 @@ def cli(
         click.echo(f"warning: {e} (auto-start disabled)", err=True)
         spec = None
 
+    # A global --state-dir names the target daemon's state dir for both control
+    # discovery (below) and liveness/cleanup; carry it into the auto-start spec
+    # too, so a daemon spawned on connection failure writes its server.json where
+    # the client then looks — otherwise the two diverge and control routes 404.
+    if spec is not None and state_dir is not None:
+        spec.state_dir = str(state_dir)
+
     # Imported here, not at module top, so commands that never reach this
     # callback (tab-completion, --help, --version) don't pull in httpx/Pydantic.
     from shrike.client import ShrikeClient
@@ -175,9 +182,9 @@ def cli(
     ctx.obj["json"] = json_output
     ctx.obj["profile"] = profile
     # The client injects --profile/--collection into every routed tool call;
-    # None uses the server's active default. `state_dir` is where the daemon wrote
-    # server.json (the control-channel address lives there); None → platform
-    # default, correct for the default daemon.
+    # None uses the server's active default. `state_dir` is the target daemon's
+    # state dir (control-channel address, liveness, auto-start location all key off
+    # it); None → platform default, correct for the default daemon.
     ctx.obj["state_dir"] = state_dir
     ctx.obj["client"] = ShrikeClient(server_url, spec=spec, collection=profile, state_dir=state_dir)
 

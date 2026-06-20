@@ -266,6 +266,29 @@ class TestLifecycle:
         with patch("shrike.client.daemon.is_server_alive", return_value=True):
             assert c.is_alive() is True
 
+    def test_liveness_keys_off_control_state_dir(self, tmp_path) -> None:
+        # A non-default --state-dir must govern liveness/cleanup, not just control
+        # discovery — otherwise autostart probes the wrong dir and spawns a dupe.
+        c = ShrikeClient("http://x:1/mcp", autostart=False, state_dir=tmp_path)
+        with patch("shrike.client.daemon.is_server_alive", return_value=True) as alive:
+            c.is_alive()
+        alive.assert_called_once_with(tmp_path)
+
+    def test_ensure_running_threads_control_state_dir(self, tmp_path) -> None:
+        spec = ServerSpec(collection="/c.anki2", port=9003, log_dir=str(tmp_path))
+        c = ShrikeClient(spec.url, spec=spec, autostart=False, state_dir=tmp_path)
+        proc = MagicMock()
+        proc.poll.return_value = None
+        with (
+            patch("shrike.client.daemon.is_server_alive", return_value=False) as alive,
+            patch("shrike.client.daemon.cleanup_state") as cleanup,
+            patch("shrike.client.subprocess.Popen", return_value=proc),
+            patch.object(ShrikeClient, "wait_until_ready", return_value={"running": True}),
+        ):
+            c.ensure_running(spec)
+        alive.assert_called_once_with(tmp_path)
+        cleanup.assert_called_once_with(tmp_path)
+
     def test_stop_delegates_to_daemon(self) -> None:
         c = ShrikeClient("http://x:1/mcp", autostart=False)
         with patch("shrike.client.daemon.stop_server", return_value={"stopped": True}) as m:
