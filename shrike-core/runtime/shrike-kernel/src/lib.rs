@@ -2842,39 +2842,92 @@ impl Kernel {
                 cross_space_tau,
                 cross_space_budget,
             };
-            // Assembly on the collection actor (it touches `core`), bracketed by
-            // the freshness stamps. `settled` is read off the ingest gauge either
-            // side of the read; `col_mod` inside, where `core` lives.
+            // Thread-domain orchestration (TIER C): the discovery reads run OFF
+            // the collection actor (on the compute pool); only the lexical scope
+            // and the prefetch hydration sit on `core`. The freshness bracket
+            // spans the whole read — `col_mod` AND `settled` are both sampled
+            // INSIDE the first and last collection jobs. Co-locating `settled`
+            // with `col_mod` (rather than reading it on the io thread) is
+            // load-bearing: the collection actor is FIFO and the ingest bumps
+            // `outstanding` before its send inside the write's job, so a write
+            // ordered before phase 1 has its bump visible to phase 1's `settled`
+            // read — an io-thread read before the job is enqueued can miss it and
+            // report a committed-but-unindexed note as fresh.
             let engine = self.index_set.primary().engine_arc();
             let derived = Arc::clone(&self.derived);
             let tag_keys = Arc::clone(&self.tag_keys);
-            let settled_start = self.is_settled();
-            let (groups, start_mod, end_mod) = self
+            let settled = self.ingest.settled_probe();
+
+            // Phase 1 (collection): the freshness start stamps + the deck/tag scope.
+            let (start_mod, start_settled, lex_scope) = {
+                let args = args.clone();
+                let settled = settled.clone();
+                self.collection
+                    .run(move |core| -> NativeResult<_> {
+                        Ok((
+                            core.col_mod()?,
+                            settled.is_settled(),
+                            actions::compute_lex_scope(core, &args)?,
+                        ))
+                    })
+                    .await??
+            };
+
+            // Phase 2 (compute, forked): the semantic + lexical discovery reads.
+            // Both `dispatch_compute` futures are scheduled eagerly, so they run
+            // concurrently on the pool regardless of await order.
+            let sem_fut = {
+                let engine = Arc::clone(&engine);
+                let vectors = vectors.clone();
+                let args = args.clone();
+                crate::runtime::dispatch_compute(move || {
+                    if args.semantic {
+                        actions::search_semantic(&*engine, &vectors, &args)
+                    } else {
+                        Ok(Vec::new())
+                    }
+                })
+            };
+            let lex_fut = {
+                let sources = sources.clone();
+                let lex_scope = lex_scope.clone();
+                let args = args.clone();
+                crate::runtime::dispatch_compute(move || {
+                    actions::search_lexical(&*derived, &sources, lex_scope.as_deref(), &args)
+                })
+            };
+            let sem_by_source = sem_fut.await?;
+            let (substr_batch, fuzzy_batch) = lex_fut.await?;
+            let discovery = actions::Discovery {
+                sem_by_source,
+                substr_batch,
+                fuzzy_batch,
+            };
+
+            // Phase 3 (collection): the prefetch hydration + assembly + end stamps.
+            let (groups, end_mod, end_settled) = self
                 .collection
                 .run(move |core| -> NativeResult<_> {
-                    let start_mod = core.col_mod()?;
-                    let groups = actions::search_notes(
+                    let groups = actions::search_assemble(
                         core,
                         Some(&*engine),
-                        Some(&*derived),
                         Some(&tag_keys),
                         &sources,
                         &vectors,
                         &args,
+                        discovery,
                     )?;
-                    let end_mod = core.col_mod()?;
-                    Ok((groups, start_mod, end_mod))
+                    Ok((groups, core.col_mod()?, settled.is_settled()))
                 })
                 .await??;
-            let settled_end = self.is_settled();
             let stale = actions::is_stale_read(
                 actions::FreshnessStamp {
                     col_mod: start_mod,
-                    settled: settled_start,
+                    settled: start_settled,
                 },
                 actions::FreshnessStamp {
                     col_mod: end_mod,
-                    settled: settled_end,
+                    settled: end_settled,
                 },
             );
             Ok((groups, stale))
