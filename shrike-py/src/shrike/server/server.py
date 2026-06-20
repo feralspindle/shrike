@@ -1773,19 +1773,30 @@ def main() -> None:
         # Run both listeners on the one loop. Harden the control socket (UDS →
         # owner-only) once it is bound. A /shutdown or signal sets should_exit on
         # both, so both serve()s return and the gather completes.
+        #
+        # The serves are explicit tasks so a startup failure in one (e.g. a bind
+        # error on the control listener) cancels the siblings rather than leaving
+        # them serving as orphans: a bare gather() propagates the first exception
+        # but lets the others run until the loop is torn down, so the data plane
+        # could briefly accept requests during a failed control-plane startup.
+        serving = [
+            asyncio.ensure_future(data_server.serve()),
+            asyncio.ensure_future(control_server.serve(**control_listener.serve_kwargs())),
+            asyncio.ensure_future(control_listener.harden(control_server)),
+        ]
         try:
-            await asyncio.gather(
-                data_server.serve(),
-                control_server.serve(**control_listener.serve_kwargs()),
-                control_listener.harden(control_server),
-            )
+            await asyncio.gather(*serving)
         except BaseException:
             # A listener failed to bind/serve at startup (or a signal-path exit
-            # replayed through here): release the OS-visible state so the next
-            # start isn't blocked by a held lock or a stale socket, then propagate.
-            # Every action is idempotent, so re-running after _signal_shutdown's
-            # own teardown is harmless (the graceful drain below is NOT repeated —
-            # it owns the kernel close, which must run exactly once).
+            # replayed through here): cancel the siblings so no listener is left
+            # serving, then release the OS-visible state so the next start isn't
+            # blocked by a held lock or a stale socket, and propagate. Every
+            # action is idempotent, so re-running after _signal_shutdown's own
+            # teardown is harmless (the graceful drain below is NOT repeated — it
+            # owns the kernel close, which must run exactly once).
+            for task in serving:
+                task.cancel()
+            await asyncio.gather(*serving, return_exceptions=True)
             control_listener.cleanup()
             with contextlib.suppress(Exception):
                 server_lock.release()
