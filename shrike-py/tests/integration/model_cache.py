@@ -82,15 +82,18 @@ ONNX_FP32_MODEL_FILES = {
     "tokenizer.json": "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/tokenizer.json",
 }
 
-# The small CLIP (image<->text) for the clip backend: an int8 dual-encoder
-# (separate text + vision graphs) + the CLIP tokenizer + image-preprocessing config. Graphs are
-# stored flat (the backend's _resolve_files finds them at the dir root via the `variant` suffix).
-# ~147 MB. jina-clip-v2 is the production-quality option; this is the CI/test fixture.
-CLIP_MODEL_DIR_NAME = "clip-vit-base-patch32-onnx"
+# The small CLIP (image<->text) for the clip backend: clip-vit-base-patch32 at q4
+# (4-bit) weight quantization — a dual-encoder (separate text + vision graphs) + the
+# CLIP tokenizer + image-preprocessing config, stored flat (the backend's
+# _resolve_files finds them at the dir root via the `variant` suffix). Same pure-ViT
+# model as the int8 export but ~half the bytes; the tokenizer + preprocessor are
+# byte-identical to the int8 export. jina-clip-v2 is the production-quality option;
+# this is the CI/test fixture.
+CLIP_MODEL_DIR_NAME = "clip-vit-base-patch32-onnx-q4"
 _CLIP_BASE = "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main"
 CLIP_MODEL_FILES = {
-    "text_model_quantized.onnx": f"{_CLIP_BASE}/onnx/text_model_quantized.onnx",
-    "vision_model_quantized.onnx": f"{_CLIP_BASE}/onnx/vision_model_quantized.onnx",
+    "text_model_q4.onnx": f"{_CLIP_BASE}/onnx/text_model_q4.onnx",
+    "vision_model_q4.onnx": f"{_CLIP_BASE}/onnx/vision_model_q4.onnx",
     "tokenizer.json": f"{_CLIP_BASE}/tokenizer.json",
     "preprocessor_config.json": f"{_CLIP_BASE}/preprocessor_config.json",
 }
@@ -292,7 +295,7 @@ def cached_onnx_fp32_model_dir(fallback_dir: Path) -> Path:
 
 
 def cached_clip_model_dir(fallback_dir: Path) -> Path:
-    """The pinned small CLIP dir (int8 text+vision graphs, 512-dim shared space)."""
+    """The pinned small CLIP dir (q4 text+vision graphs, 512-dim shared space)."""
     return _cached_model_dir(fallback_dir, CLIP_MODEL_DIR_NAME, CLIP_MODEL_FILES)
 
 
