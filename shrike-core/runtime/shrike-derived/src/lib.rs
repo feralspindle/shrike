@@ -880,9 +880,8 @@ impl DerivedEngine {
         self.swap_shadow_and_stamp(live_notes, col_mod)?;
         // Re-materialize the DF snapshot the fuzzy prune reads. Synchronous, so a
         // finished rebuild leaves it fresh; best-effort, because a refresh failure
-        // costs only prune quality and a bounded recall window (see the
-        // refresh_trigram_df doc), never the index — it must not fail an
-        // otherwise-successful rebuild.
+        // costs only prune quality — a ranking drift, see the refresh_trigram_df doc
+        // — never the index, so it must not fail an otherwise-successful rebuild.
         if let Err(e) = self.refresh_trigram_df() {
             tracing::warn!(
                 error = %e,
@@ -897,14 +896,15 @@ impl DerivedEngine {
     /// it once here lets the fuzzy prune read DF as a cheap primary-key lookup
     /// instead of re-counting doclists per query. Its own short transaction, so a
     /// concurrent reader sees the prior snapshot until it commits — never an empty
-    /// table. Between rebuilds the snapshot may lag the live index, and that lag has
-    /// a RECALL cost, not merely a ranking one: the prune sorts absent (DF-0)
-    /// trigrams last and truncates, so a trigram written since the snapshot reads as
-    /// absent — a fuzzy match whose overlap is dominated by such just-written
-    /// trigrams can fall below the floor and be DROPPED until a refresh catches up.
-    /// It is a BOUNDED window (the debounced ingest-tail refresh and the next
-    /// rebuild both close it), not a permanent loss; outside that window the lag
-    /// only mis-orders which trigrams the prune scans.
+    /// table. Between rebuilds the snapshot may lag the live index, but that lag is a
+    /// RANKING drift, not a recall loss: the prune scans every absent (DF-0) trigram
+    /// (see [`Self::prune_to_rare_terms`]), so a trigram written since the snapshot is
+    /// still scanned and a match through it is still found. What the lag affects is
+    /// the rarest-KNOWN selection — a stale DF can mis-order which present trigrams
+    /// the prune scans. (Additions only ever make a trigram likelier to be kept, so
+    /// the one residual recall risk is a DELETE drifting a present trigram's DF high
+    /// enough to drop it from the rarest set; the refresh and the next rebuild both
+    /// close that too.)
     ///
     /// # Errors
     ///
@@ -2592,31 +2592,40 @@ impl DerivedEngine {
         Some(grams.into_iter().collect())
     }
 
-    /// The fuzzy candidate trigrams: only the **rarest** (lowest document-frequency)
-    /// of `grams`, capped at [`FUZZY_MAX_TRIGRAMS`]. The common trigrams bloat the
-    /// match set and discriminate least; the rare ones are what actually find a
-    /// typo'd word. `df` is per-trigram document frequency from `idx_vocab` (0 =
-    /// absent → sorts rarest, matches nothing, harmless). The "common"/"rare"
-    /// judgement is the collection's own statistics — no language assumption. The
-    /// overlap ranker counts how many of THESE a candidate segment shares, so the
-    /// floor is over the rare set, not the full query gram set.
+    /// The fuzzy candidate trigrams the overlap ranker queries and counts: the
+    /// [`FUZZY_MAX_TRIGRAMS`] rarest KNOWN (present in the DF snapshot) trigrams,
+    /// PLUS every trigram ABSENT from the snapshot. Common trigrams bloat the match
+    /// set and discriminate least, so the rarest known ones are kept; but
+    /// absent-from-the-snapshot does NOT mean globally rare. `df` is read from the
+    /// materialized `trigram_df`, which lags the live index between rebuilds, so an
+    /// absent trigram can mean "written since the snapshot" — and truncating those
+    /// away would drop a fuzzy match whose overlap is dominated by just-written
+    /// trigrams. So absent trigrams are KEPT, not pruned:
+    /// on a FRESH snapshot they are genuine typos with empty postings (recall-safe,
+    /// results-neutral, near-free to scan), and on a STALE one they are exactly the
+    /// new trigrams the prune must scan to keep recall. The floor is over this kept
+    /// set, not the full query gram set.
     fn prune_to_rare_terms(
         grams: &std::collections::BTreeSet<String>,
         df: &std::collections::HashMap<String, i64>,
     ) -> Vec<String> {
-        let mut by_df: Vec<&String> = grams.iter().collect();
-        // Rarest PRESENT trigram first; DF 0 (absent from the index — matches
-        // nothing) sorts last so it never crowds out a rare-but-present trigram.
-        // Term as a deterministic tie-break.
-        by_df.sort_by(|a, b| {
-            let rank = |g: &String| {
-                let d = df.get(g).copied().unwrap_or(0);
-                (d == 0, d)
-            };
-            rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+        // The FUZZY_MAX_TRIGRAMS rarest PRESENT trigrams (DF ascending, term as a
+        // deterministic tie-break)...
+        let mut present: Vec<&String> = grams
+            .iter()
+            .filter(|g| df.get(*g).copied().unwrap_or(0) > 0)
+            .collect();
+        present.sort_by(|a, b| {
+            let d = |g: &String| df.get(g).copied().unwrap_or(0);
+            d(a).cmp(&d(b)).then_with(|| a.cmp(b))
         });
-        by_df.truncate(FUZZY_MAX_TRIGRAMS);
-        by_df.into_iter().cloned().collect()
+        present.truncate(FUZZY_MAX_TRIGRAMS);
+        // ...then EVERY absent (DF-0) trigram appended. `grams` is a BTreeSet, so the
+        // absent filter yields them in deterministic term order.
+        let absent = grams
+            .iter()
+            .filter(|g| df.get(*g).copied().unwrap_or(0) == 0);
+        present.into_iter().chain(absent).cloned().collect()
     }
 
     /// Accumulate one query's per-segment trigram overlap: how many of its pruned
@@ -3871,7 +3880,7 @@ mod lexical_tests {
     }
 
     #[test]
-    fn prune_to_rare_keeps_rarest_present_and_drops_common_and_absent() {
+    fn prune_to_rare_keeps_rarest_present_plus_all_absent_drops_common() {
         use std::collections::{BTreeSet, HashMap};
         let grams: BTreeSet<String> = ["aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg", "zzz"]
             .iter()
@@ -3885,22 +3894,64 @@ mod lexical_tests {
             ("eee", 2),
             ("fff", 800),
             ("ggg", 50),
-            ("zzz", 0), // absent from the index
+            ("zzz", 0), // absent from the snapshot (a typo, OR written since #958)
         ]
         .iter()
         .map(|(k, v)| (k.to_string(), *v))
         .collect();
         let terms = DerivedEngine::prune_to_rare_terms(&grams, &df);
-        // Keeps the FUZZY_MAX_TRIGRAMS (6) rarest PRESENT, rarest-first.
-        assert_eq!(terms, ["ddd", "eee", "ccc", "ggg", "bbb", "fff"]);
+        // The 6 rarest PRESENT (rarest-first), THEN every absent trigram appended.
+        assert_eq!(terms, ["ddd", "eee", "ccc", "ggg", "bbb", "fff", "zzz"]);
         assert!(
             !terms.iter().any(|t| t == "aaa"),
-            "dropped the commonest (DF 1000)"
+            "dropped the commonest PRESENT (DF 1000, beyond the rarest 6)"
         );
         assert!(
-            !terms.iter().any(|t| t == "zzz"),
-            "dropped the absent (DF 0) trigram"
+            terms.contains(&"zzz".to_string()),
+            "KEEPS the absent (DF 0) trigram — it may be written-since-snapshot"
         );
+    }
+
+    #[test]
+    fn fuzzy_finds_a_match_via_just_written_trigrams_under_a_stale_snapshot() {
+        // #958: a note matching the query ONLY through trigrams written since the DF
+        // snapshot must still surface — the prune keeps absent (DF-0) trigrams, so
+        // the overlap scan sees the just-written ones even though the snapshot lags.
+        // The old behavior (truncate the absent trigrams) dropped this note.
+        let dir = std::env::temp_dir().join(format!(
+            "shrike-derived-recall958-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = DerivedEngine::open(dir.join("shrike.db").to_str().unwrap(), 1).unwrap();
+        // Eight notes sharing a common prefix; the rebuild materializes trigram_df
+        // over THEM (so "commonprefix" trigrams are present, the suffix's are not).
+        let rows: Vec<(i64, String, String, String)> = (1..=8)
+            .map(|n| {
+                (
+                    n,
+                    "field".into(),
+                    "Front".into(),
+                    format!("commonprefix alpha {n}"),
+                )
+            })
+            .collect();
+        build_snapshot_live(&e, &rows, 1).unwrap();
+        // Incremental write (NOT a rebuild) of a note that overlaps the query ONLY
+        // via novel trigrams absent from the snapshot.
+        e.ingest_many(&[(100, vec![("Front".into(), "zzqxwv".into())])], "field")
+            .unwrap();
+        // Stale snapshot — deliberately do NOT refresh trigram_df.
+        let hits = e.search_fuzzy("commonprefixzzqxwv", 50, None, &[]).unwrap();
+        assert!(
+            hits.iter().any(|(nid, ..)| *nid == 100),
+            "note 100, matched only via just-written trigrams, must surface under a stale snapshot"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 }
 
