@@ -86,6 +86,22 @@ py_library(
     deps = [":pkg"],
 )
 
+# The process-local Prometheus metrics registry. Leaf-ish: the native runtime
+# snapshot (runtime_metrics_json) is read through the binding at scrape time.
+py_library(
+    name = "observability",
+    srcs = [
+        "observability/__init__.py",
+        "observability/metrics.py",
+    ],
+    imports = [".."],
+    deps = [
+        ":pkg",
+        "//shrike-core/bindings/shrike-pyo3:shrike_native",
+        requirement("prometheus-client"),
+    ],
+)
+
 # Shared server-local path-safety mechanism: the capability-agnostic
 # helpers store_media, export, and import all gate
 # through. Leaf — stdlib only. Lives in platform/: shared by api/actions
@@ -257,6 +273,7 @@ py_library(
     imports = [".."],
     deps = [
         ":embedding_base",
+        ":observability",  # the cooperative-lock metrics
         ":pkg",
         ":schemas",
         "//shrike-core/bindings/shrike-pyo3:shrike_native",
@@ -311,6 +328,7 @@ py_library(
         ":embedding",
         ":embedding_base",
         ":index",  # ACTIVATION_MARGIN (the cross-space floor margin default)
+        ":observability",  # index/collection/recognition op metrics
         ":pkg",
         ":profiles",
         ":recognition",
@@ -346,6 +364,7 @@ py_library(
         ":actions",
         ":collection",
         ":derived",
+        ":observability",  # per-action request metrics
         ":pkg",
         "//shrike-core/bindings/shrike-pyo3:shrike_native",
         requirement("mcp"),
@@ -401,6 +420,7 @@ py_library(
         ":export_store",  # the export download store
         ":harness",
         ":log",
+        ":observability",  # the /metrics route + per-request HTTP metrics
         ":paths",
         ":pathsafety",  # server-local path-safety helpers
         ":pkg",
@@ -467,6 +487,7 @@ py_library(
         ":harness",
         ":index",
         ":log",
+        ":observability",
         ":paths",
         ":pathsafety",
         ":pkg",
