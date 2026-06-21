@@ -197,12 +197,12 @@ class TestControlPlaneSplit:
         assert httpx.get(f"{_base_url(server)}/health", timeout=5.0).status_code == 200
         first = server.control_request("GET", "/metrics", timeout=5.0).text
         second = server.control_request("GET", "/metrics", timeout=5.0).text
+
         def request_lines(text: str) -> list[str]:
             return sorted(
-                line
-                for line in text.splitlines()
-                if line.startswith("shrike_http_requests_total{")
+                line for line in text.splitlines() if line.startswith("shrike_http_requests_total{")
             )
+
         assert request_lines(first) == request_lines(second)
         assert any('route="/health"' in line for line in request_lines(second))
 

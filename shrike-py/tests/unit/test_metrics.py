@@ -74,25 +74,22 @@ def test_native_runtime_snapshot_is_exposed(monkeypatch) -> None:
     samples = _samples(body.decode())
     assert samples["shrike_runtime_io_alive[]"] == 1
     assert samples["shrike_runtime_compute_overlap_ratio[]"] == 0.5
-    assert samples[
-        "shrike_runtime_pool_queue_depth[('pool', 'compute')]"
-    ] == 3
+    assert samples["shrike_runtime_pool_queue_depth[('pool', 'compute')]"] == 3
     assert samples["shrike_embedding_items_total[('modality', 'text')]"] == 9
-    assert samples[
-        "shrike_embedding_batches_total[('modality', 'text'), ('result', 'error')]"
-    ] == 1
+    assert samples["shrike_embedding_batches_total[('modality', 'text'), ('result', 'error')]"] == 1
 
 
 def test_index_state_is_one_hot() -> None:
     registry = Metrics()
     registry.update_index("vector", "building", 42)
     samples = _samples(registry.render()[0].decode())
-    assert samples[
-        "shrike_index_entries[('collection', 'default'), ('index', 'vector')]"
-    ] == 42
-    assert samples[
-        "shrike_index_state[('collection', 'default'), ('index', 'vector'), ('state', 'building')]"
-    ] == 1
-    assert samples[
-        "shrike_index_state[('collection', 'default'), ('index', 'vector'), ('state', 'ready')]"
-    ] == 0
+    assert samples["shrike_index_entries[('collection', 'default'), ('index', 'vector')]"] == 42
+
+    def _state_key(state: str) -> str:
+        return (
+            "shrike_index_state[('collection', 'default'), "
+            f"('index', 'vector'), ('state', '{state}')]"
+        )
+
+    assert samples[_state_key("building")] == 1
+    assert samples[_state_key("ready")] == 0

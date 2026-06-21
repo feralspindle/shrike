@@ -89,8 +89,8 @@ with contextlib.suppress(ImportError):
         native_embedder_probe,  # noqa: F401
         rehomed_actions,  # noqa: F401
         rrf_fuse,  # noqa: F401
-        runtime_probe,  # noqa: F401
         runtime_metrics_json,  # noqa: F401
+        runtime_probe,  # noqa: F401
     )
 
 __all__ = [
