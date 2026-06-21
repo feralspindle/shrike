@@ -311,6 +311,13 @@ fn runtime_probe(py: Python<'_>) {
     })
 }
 
+/// Lock-free driven-runtime metrics snapshot for the Python Prometheus collector.
+#[cfg(feature = "anki-core")]
+#[pyfunction]
+fn runtime_metrics_json() -> String {
+    shrike_kernel::runtime_metrics_json()
+}
+
 /// One derived-store MATCH row: (note_id, source, ref, txt, snippet).
 type MatchRow = (i64, String, String, Option<String>, Option<String>);
 /// One fuzzy lexical row marshalled for Python: `(note_id, source, ref, match)`
@@ -1266,6 +1273,7 @@ fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(drive_compute, m)?)?;
         m.add_function(wrap_pyfunction!(drive_pools_shutdown, m)?)?;
         m.add_function(wrap_pyfunction!(runtime_probe, m)?)?;
+        m.add_function(wrap_pyfunction!(runtime_metrics_json, m)?)?;
     }
     // The engine/manager matrix: a class is present exactly when its
     // feature is compiled — a lean build simply lacks the name (the Python

@@ -65,6 +65,7 @@ from shrike_native._native import native_embedder_probe as native_embedder_probe
 from shrike_native._native import rehomed_actions as rehomed_actions
 from shrike_native._native import rrf_fuse as rrf_fuse
 from shrike_native._native import runtime_probe as runtime_probe
+from shrike_native._native import runtime_metrics_json as runtime_metrics_json
 
 __all__ = [
     "BATCH_DRIFT_TOL",

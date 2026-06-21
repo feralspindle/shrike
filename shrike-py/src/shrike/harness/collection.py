@@ -24,6 +24,7 @@ import logging
 import mimetypes
 import os
 import re
+import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -33,6 +34,7 @@ import shrike_native
 from shrike_native import CollectionCore
 
 from shrike.harness.engines.embedding.base import NoteEmbedInput
+from shrike.observability.metrics import metrics
 from shrike.schemas import COLLECTION_BUSY_CODE
 
 logger = logging.getLogger("shrike.collection")
@@ -183,6 +185,7 @@ class CollectionWrapper:
         self._on_acquire = on_acquire
         self._open_flag = False
         self._release_handle: asyncio.TimerHandle | None = None
+        self._metrics_key = "default"
         # Standalone mode (tests, library use): the wrapper owns the worker
         # thread. The server uses `over_kernel` instead, where the kernel's
         # injected executor is the one serialization domain.
@@ -204,6 +207,7 @@ class CollectionWrapper:
         *,
         cooperative: bool = False,
         hold_seconds: float = DEFAULT_LOCK_HOLD,
+        collection_key: str = "default",
     ) -> CollectionWrapper:
         """The server's mode: wrap the kernel's OWN collection.
 
@@ -224,6 +228,9 @@ class CollectionWrapper:
         self._release_handle = None
         self._kernel = kernel
         self._executor = None
+        # The ``collection`` label for this wrapper's lock_held gauge — "default"
+        # for the boot collection, the registry profile name for a routed one.
+        self._metrics_key = collection_key
         self.core = kernel.core_handle()
         atexit.register(self.close)
         return self
@@ -276,11 +283,17 @@ class CollectionWrapper:
         as :class:`CollectionBusyError` — typed, immediate, retryable.
         """
         if not self._open_flag:
+            started = time.perf_counter()
             try:
                 self.core.reopen()
             except shrike_native.NativeBusyError as e:
+                metrics.lock_attempts.labels("busy").inc()
+                metrics.lock_wait.labels("busy").observe(time.perf_counter() - started)
                 raise CollectionBusyError() from e
+            metrics.lock_attempts.labels("acquired").inc()
+            metrics.lock_wait.labels("acquired").observe(time.perf_counter() - started)
             self._open_flag = True
+            metrics.lock_held.labels(self._metrics_key).set(1)
             logger.debug("Re-acquired collection at %s", self._path)
             if self._on_acquire is not None:
                 with contextlib.suppress(Exception):
@@ -350,6 +363,7 @@ class CollectionWrapper:
         with contextlib.suppress(Exception):
             self.core.release()
         self._open_flag = False
+        metrics.lock_held.labels(self._metrics_key).set(0)
         logger.debug("Released collection lock after idle")
 
     def release_now(self) -> None:
