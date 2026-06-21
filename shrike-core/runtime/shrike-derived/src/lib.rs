@@ -856,6 +856,12 @@ impl DerivedEngine {
             let chunk = chunk?;
             total += self.insert_field_chunk_to_shadow(&chunk)?;
         }
+        // Merge the shadow down to one segment BEFORE the swap. The chunk-per-
+        // transaction stream leaves it fragmented across many segments, and this is
+        // the cheapest place to compact it: on the shadow OFF the live tables (no
+        // recall window) and OUTSIDE the swap transaction (the swap stays short), so
+        // the index a search hammers lands compact, not fragmented.
+        self.optimize_shadow()?;
         // Atomic swap: prune dead-note rows, rename the shadow over the live
         // tables, stamp col_mod — all in ONE short transaction.
         self.swap_shadow_and_stamp(live_notes, col_mod)?;
@@ -879,6 +885,18 @@ impl DerivedEngine {
             [],
         )
         .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Merge `idx_shadow` down to one segment (FTS5 `optimize`), on the write
+    /// connection. Run BEFORE the swap so a freshly-built index lands compact with
+    /// no recall window (the shadow is off the live tables). FTS5 `optimize` is
+    /// physical-only — rowids, content, and the idx↔rowmap pairing are preserved —
+    /// so the col_mod watermark and DF-based fuzzy ranking are untouched.
+    fn optimize_shadow(&self) -> NativeResult<()> {
+        let conn = self.lock();
+        conn.execute("INSERT INTO idx_shadow(idx_shadow) VALUES('optimize')", [])
+            .map_err(db_err)?;
         Ok(())
     }
 
