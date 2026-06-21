@@ -246,10 +246,9 @@ class TestServerStop:
     def test_not_running_cleans_stale_state(self, run):
         with (
             patch(f"{SC}.is_server_alive", return_value=False),
-            patch(f"{SC}.META_FILE") as meta_file,
+            patch(f"{SC}.read_server_meta", return_value={"pid": 1}),
             patch(f"{SC}.cleanup_state") as cleanup,
         ):
-            meta_file.exists.return_value = True
             result = run("server", "stop")
         cleanup.assert_called_once()
         assert "stale state" in result.output
@@ -591,3 +590,26 @@ class TestWaitForServer:
             with patch("shrike.server.main", MagicMock()) as m:
                 assert shrike.server.main is m
             assert callable(shrike.server.main)  # restored to the real wrapper
+
+
+class TestGlobalStateDirWiring:
+    def test_state_dir_threads_into_autostart_spec(self, tmp_path: Path) -> None:
+        # A global --state-dir must reach the auto-start spec, not just control
+        # discovery, so a daemon spawned on connection failure writes server.json
+        # where the client then looks (otherwise control routes 404 on a mismatch).
+        cfg = tmp_path / "config.yml"
+        cfg.write_text("collection: /c.anki2\n")
+        custom = tmp_path / "custom-state"
+        status_client = MagicMock()
+        status_client.server_status.return_value = _server()
+        with (
+            patch("shrike.client.ShrikeClient", return_value=MagicMock()) as root_ctor,
+            patch(f"{SC}.ShrikeClient", return_value=status_client),
+        ):
+            result = CliRunner().invoke(
+                cli, ["--config", str(cfg), "--state-dir", str(custom), "server", "status"]
+            )
+        assert result.exit_code == 0
+        _, kwargs = root_ctor.call_args
+        assert kwargs["state_dir"] == custom
+        assert kwargs["spec"].state_dir == str(custom)

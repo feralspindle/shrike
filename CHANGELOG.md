@@ -31,6 +31,11 @@ to [Semantic Versioning](https://semver.org/). While in `0.x`, the public surfac
   whether a live embedding space serves it — so "can I search images by
   content right now" has a direct answer instead of being inferred from the
   backend name.
+- `--state-dir` (and the `SHRIKE_STATE_DIR` env var) on the `shrike` CLI
+  (#795): targets a daemon started with a non-default `--state-dir`, so
+  `shrike server status`/`stop` and the `server embedding`/`server index`
+  commands reach its control channel. Unset, the platform default is used (the
+  common case).
 
 ### Removed
 - In-process Apple Vision OCR is no longer compiled into the server (#496):
@@ -90,6 +95,22 @@ to [Semantic Versioning](https://semver.org/). While in `0.x`, the public surfac
   renamed to `gpu` (`pip install 'shrike-mcp[gpu]'`; the CUDA/TensorRT
   onnxruntime build still must replace the base one, which pip cannot do for
   you — uninstall `onnxruntime` after installing).
+
+### Security
+- The daemon's privileged control operations are isolated from the
+  network-exposable data plane (#795). Shutdown, reload, index rebuild/save, the
+  embedding spawn/stop, and the full status diagnostics now run on a separate,
+  always-local channel — a Unix socket (macOS/Linux) or a loopback-only port
+  (Windows) — that `--allow-remote` and the other exposure flags never widen.
+  Exposing the MCP/data surface to the network therefore no longer also exposes
+  the embedding subprocess spawn or shutdown, closing the structural capability
+  bleed that the `/embedding/start` gate (#791) only patched per-endpoint. The
+  CLI and MCP clients use the new channel automatically, and the data port now
+  answers a minimal `GET /health` (running + protocol version) for liveness.
+  **Breaking only for scripts that call `/status`, `/shutdown`, `/reload`,
+  `/index/*`, or `/embedding/*` over HTTP directly** — those routes are no longer
+  on the MCP/data port; the control channel's address is recorded in
+  `server.json`.
 
 ## [0.4.0] — 2026-06-06
 

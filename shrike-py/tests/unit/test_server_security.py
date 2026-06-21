@@ -9,8 +9,11 @@ import pytest
 from mcp.server.transport_security import TransportSecurityMiddleware
 
 from shrike.server.server import (
+    _EXEC_SHAPING_OVERRIDES,
     _build_transport_security,
+    _ControlListener,
     _is_loopback,
+    _rejected_exec_overrides,
     _server_is_purely_local,
     _validate_media_path_root,
     create_mcp,
@@ -282,3 +285,84 @@ def test_media_path_root_rejects_a_file(tmp_path) -> None:
     f.write_text("x")
     with pytest.raises(ValueError, match="not an existing directory"):
         _validate_media_path_root(str(f))
+
+
+# -- _rejected_exec_overrides: gates the /embedding/start execution params (#791) --
+
+
+def test_purely_local_allows_every_exec_override() -> None:
+    # The local operator's CLI flow (`shrike embedding start --llama-server ...`):
+    # a purely-local server forwards execution-shaping overrides untouched.
+    overrides = {k: "x" for k in _EXEC_SHAPING_OVERRIDES}
+    assert _rejected_exec_overrides(overrides, purely_local=True) == []
+
+
+@pytest.mark.parametrize("key", _EXEC_SHAPING_OVERRIDES)
+def test_non_local_rejects_each_exec_override(key: str) -> None:
+    # The capability hole: a non-purely-local server must refuse a body that
+    # chooses the spawned binary/model/args/providers/backend.
+    assert _rejected_exec_overrides({key: "x"}, purely_local=False) == [key]
+
+
+def test_non_local_reports_all_rejected_keys_in_order() -> None:
+    overrides = {k: "x" for k in _EXEC_SHAPING_OVERRIDES}
+    assert _rejected_exec_overrides(overrides, purely_local=False) == list(_EXEC_SHAPING_OVERRIDES)
+
+
+def test_llama_server_is_gated() -> None:
+    # The direct-RCE param specifically: a caller-supplied binary path is never
+    # honoured on a non-purely-local server.
+    assert _rejected_exec_overrides({"llama_server": "/tmp/evil"}, purely_local=False) == [
+        "llama_server"
+    ]
+
+
+@pytest.mark.parametrize("key", ["port", "context_size", "threads", "gpu_layers", "pooling"])
+def test_non_local_allows_runtime_knobs(key: str) -> None:
+    # Numeric/enum runtime knobs don't choose what executes, so they pass through
+    # even when the server is not purely-local.
+    assert _rejected_exec_overrides({key: 1}, purely_local=False) == []
+
+
+def test_empty_body_is_never_rejected() -> None:
+    # A no-override start ("start what the daemon was configured with") is always
+    # allowed, even on a non-purely-local server.
+    assert _rejected_exec_overrides({}, purely_local=False) == []
+
+
+# -- _ControlListener.operator_gated drives the /embedding/start exec gate --
+#
+# The gate keys on the control transport's trust: a filesystem-gated UDS confines
+# callers to the operator (overrides allowed); the Windows loopback-TCP fallback
+# is reachable by any local user (overrides refused — the #791 RCE class).
+
+
+def test_uds_control_listener_is_operator_gated(tmp_path) -> None:
+    listener = _ControlListener(tmp_path)
+    try:
+        assert listener.uds is not None  # POSIX default
+        assert listener.operator_gated is True
+        # The gate therefore ACCEPTS exec overrides on a UDS control plane.
+        assert (
+            _rejected_exec_overrides({"llama_server": "/x"}, purely_local=listener.operator_gated)
+            == []
+        )
+    finally:
+        listener.cleanup()
+
+
+def test_loopback_tcp_control_listener_is_not_operator_gated(monkeypatch, tmp_path) -> None:
+    # Force the Windows branch: a pre-bound loopback-TCP socket, reachable by any
+    # local user — so it must NOT be operator-gated, and the gate must REFUSE
+    # caller-supplied exec params there.
+    monkeypatch.setattr("shrike.server.server.sys.platform", "win32")
+    listener = _ControlListener(tmp_path)
+    try:
+        assert listener.uds is None
+        assert listener.host == "127.0.0.1" and listener.port  # ephemeral TCP
+        assert listener.operator_gated is False
+        assert _rejected_exec_overrides(
+            {"llama_server": "/x"}, purely_local=listener.operator_gated
+        ) == ["llama_server"]
+    finally:
+        listener.cleanup()
