@@ -1766,6 +1766,7 @@ pub enum StopResponse {
 /// a caller mistake — a `ToolInputError` or argument-validation failure);
 /// `collection_busy` (409, contention under cooperative locking — the op
 /// never ran, retryable); `unknown_action` (404, no such action name);
+/// `not_ready` (503, the readiness gate timed out — transient, retryable);
 /// `internal_error` (500, an unexpected server bug — detail logged, never
 /// returned, so it can't leak to a UI client).
 ///
@@ -1783,6 +1784,7 @@ pub enum ActionErrorCode {
     InputError,
     CollectionBusy,
     UnknownAction,
+    NotReady,
     InternalError,
 }
 

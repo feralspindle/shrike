@@ -50,18 +50,83 @@
 
 use std::cell::Cell;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use shrike_error::{NativeError, NativeResult};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
+/// Which driven queue an enqueue targets.
+#[derive(Clone, Copy)]
+enum QueueKind {
+    Collection,
+    Compute,
+}
+
 /// A pool job: a boxed sync closure that carries its own completion channel, so
 /// finishing it wakes the awaiting async task. Unbounded queues, like the
 /// collection actor's channel — backpressure is the harness's committed pool
 /// size, not the channel.
-type PoolJob = Box<dyn FnOnce() + Send + 'static>;
+struct PoolJob {
+    work: Box<dyn FnOnce() + Send + 'static>,
+    queued_at: Instant,
+    kind: QueueKind,
+}
+
+const METRIC_BUCKETS_SECONDS: [f64; 13] = [
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+struct PoolMetrics {
+    configured: AtomicU64,
+    workers: AtomicU64,
+    queued: AtomicU64,
+    active: AtomicU64,
+    completed: AtomicU64,
+    queue_wait_ns: AtomicU64,
+    job_duration_ns: AtomicU64,
+    queue_wait_buckets: [AtomicU64; 13],
+    job_duration_buckets: [AtomicU64; 13],
+    // Per-histogram observation counts. Distinct from `completed` (jobs that
+    // finished run_job): a queue_wait observation lands when a job STARTS, an
+    // entire job duration before `completed` is bumped, so reusing `completed`
+    // as the histogram count would render an implicit +Inf bucket smaller than a
+    // finite bucket — an invalid Prometheus histogram. Incremented before the
+    // bucket bumps (see `observe`) so a scrape only ever sees count >= bucket.
+    queue_wait_count: AtomicU64,
+    job_duration_count: AtomicU64,
+}
+
+impl PoolMetrics {
+    fn new() -> Self {
+        Self {
+            configured: AtomicU64::new(0),
+            workers: AtomicU64::new(0),
+            queued: AtomicU64::new(0),
+            active: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            queue_wait_ns: AtomicU64::new(0),
+            job_duration_ns: AtomicU64::new(0),
+            queue_wait_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            job_duration_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            queue_wait_count: AtomicU64::new(0),
+            job_duration_count: AtomicU64::new(0),
+        }
+    }
+
+    fn observe(elapsed_ns: u64, sum: &AtomicU64, buckets: &[AtomicU64; 13]) {
+        sum.fetch_add(elapsed_ns, Ordering::Relaxed);
+        let seconds = elapsed_ns as f64 / 1_000_000_000.0;
+        for (limit, bucket) in METRIC_BUCKETS_SECONDS.iter().zip(buckets) {
+            if seconds <= *limit {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
 
 /// The work queues + their receivers, installed by [`init_driven_runtime`]. The
 /// collection receiver is single-consumer (one [`drive_collection`] thread); the compute
@@ -87,6 +152,9 @@ struct DrivenPools {
     /// [`drive_io_until_shutdown`] (the binding's IO thread), so all N + 2
     /// committed threads return from one shutdown call.
     shutdown: Notify,
+    collection_metrics: PoolMetrics,
+    compute_metrics: PoolMetrics,
+    io_alive: AtomicBool,
 }
 
 impl DrivenPools {
@@ -106,9 +174,115 @@ impl DrivenPools {
             .expect("driven compute sender poisoned")
             .clone()
     }
+
+    fn metrics(&self, kind: QueueKind) -> &PoolMetrics {
+        match kind {
+            QueueKind::Collection => &self.collection_metrics,
+            QueueKind::Compute => &self.compute_metrics,
+        }
+    }
+
+    fn job(&self, kind: QueueKind, work: Box<dyn FnOnce() + Send + 'static>) -> PoolJob {
+        self.metrics(kind).queued.fetch_add(1, Ordering::Relaxed);
+        PoolJob {
+            work,
+            queued_at: Instant::now(),
+            kind,
+        }
+    }
+
+    fn run_job(&self, job: PoolJob) {
+        let metrics = self.metrics(job.kind);
+        metrics.queued.fetch_sub(1, Ordering::Relaxed);
+        // Bump the histogram count before its buckets (count-first) so a scrape
+        // never reads count < a bucket, which would be an invalid histogram.
+        metrics.queue_wait_count.fetch_add(1, Ordering::Relaxed);
+        PoolMetrics::observe(
+            job.queued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            &metrics.queue_wait_ns,
+            &metrics.queue_wait_buckets,
+        );
+        metrics.active.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        (job.work)();
+        metrics.job_duration_count.fetch_add(1, Ordering::Relaxed);
+        PoolMetrics::observe(
+            started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            &metrics.job_duration_ns,
+            &metrics.job_duration_buckets,
+        );
+        metrics.active.fetch_sub(1, Ordering::Relaxed);
+        metrics.completed.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 static DRIVEN: OnceLock<DrivenPools> = OnceLock::new();
+static SAVER_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static SAVER_RUNS: AtomicU64 = AtomicU64::new(0);
+static SAVER_ERRORS: AtomicU64 = AtomicU64::new(0);
+static SAVER_PENDING: AtomicU64 = AtomicU64::new(0);
+static SAVER_DURATION_NS: AtomicU64 = AtomicU64::new(0);
+static SAVER_DURATION_BUCKETS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+
+struct EmbeddingMetrics {
+    calls: AtomicU64,
+    items: AtomicU64,
+    errors: AtomicU64,
+    duration_ns: AtomicU64,
+    duration_buckets: [AtomicU64; 13],
+}
+
+impl EmbeddingMetrics {
+    fn new() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            items: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            duration_ns: AtomicU64::new(0),
+            duration_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+static EMBEDDING_TEXT: OnceLock<EmbeddingMetrics> = OnceLock::new();
+static EMBEDDING_IMAGE: OnceLock<EmbeddingMetrics> = OnceLock::new();
+
+/// Record one production embedding batch without coupling the engine contracts
+/// to a metrics implementation. Called by the binding-owned observed adapter.
+pub fn record_embedding(modality: &str, items: usize, elapsed: Duration, success: bool) {
+    let signal = match modality {
+        "image" => EMBEDDING_IMAGE.get_or_init(EmbeddingMetrics::new),
+        _ => EMBEDDING_TEXT.get_or_init(EmbeddingMetrics::new),
+    };
+    signal.calls.fetch_add(1, Ordering::Relaxed);
+    signal.items.fetch_add(items as u64, Ordering::Relaxed);
+    if !success {
+        signal.errors.fetch_add(1, Ordering::Relaxed);
+    }
+    PoolMetrics::observe(
+        elapsed.as_nanos().min(u64::MAX as u128) as u64,
+        &signal.duration_ns,
+        &signal.duration_buckets,
+    );
+}
+
+pub(crate) fn record_saver_request(pending: u64) {
+    SAVER_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    SAVER_PENDING.store(pending, Ordering::Relaxed);
+}
+
+pub(crate) fn record_saver_run(result: bool, elapsed: Duration) {
+    SAVER_RUNS.fetch_add(1, Ordering::Relaxed);
+    if !result {
+        SAVER_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
+    PoolMetrics::observe(
+        elapsed.as_nanos().min(u64::MAX as u128) as u64,
+        &SAVER_DURATION_NS,
+        &SAVER_DURATION_BUCKETS,
+    );
+    SAVER_PENDING.store(0, Ordering::Relaxed);
+}
 
 thread_local! {
     /// Set while a [`drive_collection`]/[`drive_compute`] job runs, so the dispatch
@@ -153,6 +327,9 @@ pub fn init_driven_runtime(
         collection_rx: Mutex::new(Some(collection_rx)),
         compute_rx: Arc::new(Mutex::new(compute_rx)),
         shutdown: Notify::new(),
+        collection_metrics: PoolMetrics::new(),
+        compute_metrics: PoolMetrics::new(),
+        io_alive: AtomicBool::new(false),
     });
     Ok(())
 }
@@ -216,7 +393,9 @@ pub fn drive_io<F: Future<Output = ()> + Send + 'static>(until: F) -> NativeResu
 /// Returns an error if the driven runtime is not installed.
 pub fn drive_io_until_shutdown() -> NativeResult<()> {
     let pools = DRIVEN.get().ok_or_else(driven_missing)?;
+    pools.io_alive.store(true, Ordering::Relaxed);
     block_on(pools.shutdown.notified());
+    pools.io_alive.store(false, Ordering::Relaxed);
     Ok(())
 }
 
@@ -251,9 +430,21 @@ pub fn drive_collection() -> NativeResult<()> {
         .ok_or_else(|| {
             NativeError::internal("drive_collection was already claimed by another thread")
         })?;
+    pools
+        .collection_metrics
+        .configured
+        .fetch_add(1, Ordering::Relaxed);
+    pools
+        .collection_metrics
+        .workers
+        .fetch_add(1, Ordering::Relaxed);
     while let Some(job) = rx.blocking_recv() {
-        job();
+        pools.run_job(job);
     }
+    pools
+        .collection_metrics
+        .workers
+        .fetch_sub(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -279,6 +470,14 @@ pub fn drive_collection() -> NativeResult<()> {
 /// panicked).
 pub fn drive_compute() -> NativeResult<()> {
     let pools = DRIVEN.get().ok_or_else(driven_missing)?;
+    pools
+        .compute_metrics
+        .configured
+        .fetch_add(1, Ordering::Relaxed);
+    pools
+        .compute_metrics
+        .workers
+        .fetch_add(1, Ordering::Relaxed);
     let rx = Arc::clone(&pools.compute_rx);
     loop {
         // Hold the dequeue lock only to pop; run the job lock-free so N workers
@@ -288,10 +487,14 @@ pub fn drive_compute() -> NativeResult<()> {
             guard.blocking_recv()
         };
         match job {
-            Some(job) => job(),
+            Some(job) => pools.run_job(job),
             None => break, // every sender dropped ⇒ shutdown
         }
     }
+    pools
+        .compute_metrics
+        .workers
+        .fetch_sub(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -354,16 +557,18 @@ pub fn submit_blocking<T: Send + 'static>(
         "leaf-invariant: a pool job must not submit-and-block on further pool work (submit_blocking)"
     );
     let (tx, rx) = std::sync::mpsc::channel();
-    let job: PoolJob = Box::new(move || {
+    let work = Box::new(move || {
         let _ = tx.send(run_in_pool_job(work));
     });
-    DRIVEN
-        .get()
-        .ok_or_else(driven_missing)?
+    let pools = DRIVEN.get().ok_or_else(driven_missing)?;
+    let sender = pools
         .compute_sender()
-        .ok_or_else(|| NativeError::internal("the compute pool is gone"))?
-        .send(job)
-        .map_err(|_| NativeError::internal("the compute pool is gone"))?;
+        .ok_or_else(|| NativeError::internal("the compute pool is gone"))?;
+    let job = pools.job(QueueKind::Compute, work);
+    if sender.send(job).is_err() {
+        pools.compute_metrics.queued.fetch_sub(1, Ordering::Relaxed);
+        return Err(NativeError::internal("the compute pool is gone"));
+    }
     rx.recv()
         .map_err(|_| NativeError::internal("the compute worker dropped a job"))?
 }
@@ -463,22 +668,22 @@ pub fn submit_compute(job: Box<dyn FnOnce() + Send + 'static>) {
         !IN_POOL_JOB.with(Cell::get),
         "leaf-invariant: a pool job must not submit further pool work (submit_compute)"
     );
-    let contained: PoolJob = Box::new(move || {
+    let contained = Box::new(move || {
         let _ = run_in_pool_job(move || {
             job();
             Ok::<(), NativeError>(())
         });
     });
-    if let Some(sender) = DRIVEN.get().and_then(DrivenPools::compute_sender) {
-        let _ = sender.send(contained);
+    if let Some(pools) = DRIVEN.get() {
+        if let Some(sender) = pools.compute_sender() {
+            if sender
+                .send(pools.job(QueueKind::Compute, contained))
+                .is_err()
+            {
+                pools.compute_metrics.queued.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
     }
-}
-
-/// Which driven queue an enqueue targets.
-#[derive(Clone, Copy)]
-enum QueueKind {
-    Collection,
-    Compute,
 }
 
 /// The shared body of `dispatch_collection`/`dispatch_compute`: enqueue onto the
@@ -489,7 +694,7 @@ fn enqueue<T: Send + 'static>(
     work: impl FnOnce() -> NativeResult<T> + Send + 'static,
 ) -> futures::future::BoxFuture<'static, NativeResult<T>> {
     let (tx, rx) = oneshot::channel();
-    let job: PoolJob = Box::new(move || {
+    let work = Box::new(move || {
         let _ = tx.send(run_in_pool_job(work));
     });
     // If the queue is gone (shutdown took the sender, or no driven runtime
@@ -500,7 +705,9 @@ fn enqueue<T: Send + 'static>(
             QueueKind::Compute => pools.compute_sender(),
         };
         if let Some(sender) = sender {
-            let _ = sender.send(job);
+            if sender.send(pools.job(kind, work)).is_err() {
+                pools.metrics(kind).queued.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
     Box::pin(async move {
@@ -514,6 +721,83 @@ fn enqueue<T: Send + 'static>(
 /// taken) is a loud error, not threads that quietly fail to drive.
 pub fn is_driven() -> bool {
     DRIVEN.get().is_some()
+}
+
+/// A lock-free JSON snapshot consumed by the Python Prometheus collector.
+pub fn runtime_metrics_json() -> String {
+    fn pool(metrics: &PoolMetrics) -> serde_json::Value {
+        let histogram = |sum: &AtomicU64, buckets: &[AtomicU64; 13], count: u64| {
+            serde_json::json!({
+                "count": count,
+                "sum_seconds": sum.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+                "buckets": METRIC_BUCKETS_SECONDS.iter().zip(buckets).map(|(limit, value)| {
+                    serde_json::json!([limit, value.load(Ordering::Relaxed)])
+                }).collect::<Vec<_>>()
+            })
+        };
+        let completed = metrics.completed.load(Ordering::Relaxed);
+        serde_json::json!({
+            "configured": metrics.configured.load(Ordering::Relaxed),
+            "workers": metrics.workers.load(Ordering::Relaxed),
+            "queued": metrics.queued.load(Ordering::Relaxed),
+            "active": metrics.active.load(Ordering::Relaxed),
+            "completed": completed,
+            "queue_wait": histogram(
+                &metrics.queue_wait_ns,
+                &metrics.queue_wait_buckets,
+                metrics.queue_wait_count.load(Ordering::Relaxed),
+            ),
+            "job_duration": histogram(
+                &metrics.job_duration_ns,
+                &metrics.job_duration_buckets,
+                metrics.job_duration_count.load(Ordering::Relaxed),
+            ),
+        })
+    }
+    fn embedding(metrics: Option<&EmbeddingMetrics>) -> serde_json::Value {
+        let Some(metrics) = metrics else {
+            return serde_json::json!({});
+        };
+        let calls = metrics.calls.load(Ordering::Relaxed);
+        serde_json::json!({
+            "calls": calls,
+            "items": metrics.items.load(Ordering::Relaxed),
+            "errors": metrics.errors.load(Ordering::Relaxed),
+            "duration": {
+                "count": calls,
+                "sum_seconds": metrics.duration_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+                "buckets": METRIC_BUCKETS_SECONDS.iter().zip(&metrics.duration_buckets).map(
+                    |(limit, value)| serde_json::json!([limit, value.load(Ordering::Relaxed)])
+                ).collect::<Vec<_>>()
+            }
+        })
+    }
+    let Some(pools) = DRIVEN.get() else {
+        return serde_json::json!({"io_alive": false}).to_string();
+    };
+    serde_json::json!({
+        "io_alive": pools.io_alive.load(Ordering::Relaxed),
+        "collection": pool(&pools.collection_metrics),
+        "compute": pool(&pools.compute_metrics),
+        "saver": {
+            "requests": SAVER_REQUESTS.load(Ordering::Relaxed),
+            "runs": SAVER_RUNS.load(Ordering::Relaxed),
+            "errors": SAVER_ERRORS.load(Ordering::Relaxed),
+            "pending": SAVER_PENDING.load(Ordering::Relaxed),
+            "duration": {
+                "count": SAVER_RUNS.load(Ordering::Relaxed),
+                "sum_seconds": SAVER_DURATION_NS.load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+                "buckets": METRIC_BUCKETS_SECONDS.iter().zip(&SAVER_DURATION_BUCKETS).map(
+                    |(limit, value)| serde_json::json!([limit, value.load(Ordering::Relaxed)])
+                ).collect::<Vec<_>>()
+            },
+        },
+        "embedding": {
+            "text": embedding(EMBEDDING_TEXT.get()),
+            "image": embedding(EMBEDDING_IMAGE.get()),
+        },
+    })
+    .to_string()
 }
 
 /// Run a pool job body with the leaf-invariant tripwire armed AND its panic
@@ -792,6 +1076,34 @@ mod leaf_invariant {
         let out: NativeResult<u64> =
             testing::run(async { dispatch_compute(|| Ok(0x5031_u64)).await });
         assert_eq!(out.unwrap(), 0x5031);
+
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&runtime_metrics_json()).expect("metrics snapshot is JSON");
+        assert_eq!(snapshot["io_alive"], true);
+        assert!(snapshot["compute"]["workers"].as_u64().unwrap() >= 2);
+        assert!(snapshot["compute"]["completed"].as_u64().unwrap() >= 1);
+        assert!(
+            snapshot["compute"]["job_duration"]["count"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+        // The histogram count is the implicit +Inf bucket, so it must be >= every
+        // finite cumulative bucket — reusing the lagging `completed` counter would
+        // break this. Assert it across both histograms and pools.
+        for pool in ["collection", "compute"] {
+            for hist in ["queue_wait", "job_duration"] {
+                let h = &snapshot[pool][hist];
+                let count = h["count"].as_u64().unwrap();
+                for bucket in h["buckets"].as_array().unwrap() {
+                    let value = bucket[1].as_u64().unwrap();
+                    assert!(
+                        count >= value,
+                        "{pool}/{hist}: count {count} < bucket {value} — invalid histogram"
+                    );
+                }
+            }
+        }
     }
 
     /// A leaf job that RE-ENTERS dispatch (the deadlock shape) trips the

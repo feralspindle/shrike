@@ -710,6 +710,7 @@ impl DebouncedSaver {
             Box::new(move || {
                 let orch = Arc::clone(&orch);
                 Box::pin(async move {
+                    let started = std::time::Instant::now();
                     // The blocking file write rides the compute pool; a detached
                     // runtime future (driven by `drive_io`) awaits the pool job,
                     // keeping the write off every timer and op-tail path.
@@ -719,7 +720,7 @@ impl DebouncedSaver {
                             e
                         })
                     });
-                    let _ = save.await;
+                    crate::runtime::record_saver_run(save.await.is_ok(), started.elapsed());
                 })
             }),
             delay,
@@ -732,6 +733,7 @@ impl DebouncedSaver {
     /// Record a change: re-arm the idle timer, or flush now at the burst cap.
     pub fn request_save(&self) {
         self.job.request();
+        crate::runtime::record_saver_request(self.job.pending());
     }
 
     /// Unsaved changes since the last flush was handed off.
@@ -744,7 +746,10 @@ impl DebouncedSaver {
     /// returns only after the write lands).
     pub fn flush(&self) {
         self.job.cancel();
-        if let Err(e) = self.orchestrator.save() {
+        let started = std::time::Instant::now();
+        let result = self.orchestrator.save();
+        crate::runtime::record_saver_run(result.is_ok(), started.elapsed());
+        if let Err(e) = result {
             tracing::warn!(error = ?e, "debounced index save failed");
         }
     }

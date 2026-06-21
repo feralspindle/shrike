@@ -20,6 +20,7 @@ import inspect
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from typing import Any
 
 import shrike_native
@@ -33,8 +34,14 @@ from shrike.api.actions import (
     _call_outcome,
 )
 from shrike.harness.collection import CollectionBusyError
+from shrike.observability.metrics import metrics
 
 logger = logging.getLogger("shrike.tools")
+
+# The same wrapped action implementation serves MCP and actions-over-HTTP.  The
+# HTTP handler sets this for the duration of Tool.run; MCP naturally retains the
+# default.  ContextVar keeps concurrent requests isolated.
+_action_transport: ContextVar[str] = ContextVar("shrike_action_transport", default="mcp")
 
 # The readiness gate: an async callable that resolves once the data plane is
 # open (boot/reload/re-acquire maintenance has settled). None disables gating
@@ -89,6 +96,10 @@ def _log_completed(name: str, kwargs: dict[str, Any], started: float) -> None:
     logger.info("%s%s%s -> %s (%.0fms)", name, " " if params else "", params, outcome, elapsed_ms)
 
 
+def _record_action(name: str, started: float, result: str) -> None:
+    metrics.observe_action(name, _action_transport.get(), result, time.perf_counter() - started)
+
+
 def _safe_tool(fn: Any) -> Any:
     """Wrap a tool to log unhandled exceptions, then re-raise.
 
@@ -118,11 +129,13 @@ def _safe_tool(fn: Any) -> Any:
             except ToolInputError as e:
                 # Expected bad input — the caller's mistake, surfaced without a trace.
                 logger.warning("%s rejected: %s", fn.__name__, e)
+                _record_action(fn.__name__, started, "input_error")
                 raise
             except CollectionBusyError as e:
                 # Expected under cooperative locking — another process holds the
                 # collection. Surface the coded message (client maps it), no trace.
                 logger.warning("%s in %s", e, fn.__name__)
+                _record_action(fn.__name__, started, "collection_busy")
                 raise
             except shrike_native.NativeBusyError as e:
                 # The same contention, surfaced by a kernel-routed op (the
@@ -130,11 +143,17 @@ def _safe_tool(fn: Any) -> Any:
                 # typed busy surface so the client's retry contract holds.
                 busy = CollectionBusyError()
                 logger.warning("%s in %s", busy, fn.__name__)
+                _record_action(fn.__name__, started, "collection_busy")
                 raise busy from e
+            except ServerNotReadyError:
+                _record_action(fn.__name__, started, "not_ready")
+                raise
             except Exception:
                 logger.exception("Unhandled error in %s", fn.__name__)
+                _record_action(fn.__name__, started, "internal_error")
                 raise
             _log_completed(fn.__name__, kwargs, started)
+            _record_action(fn.__name__, started, "ok")
             return result
 
         async_wrapper.__doc__ = cleaned_doc
@@ -148,18 +167,26 @@ def _safe_tool(fn: Any) -> Any:
             result = fn(*args, **kwargs)
         except ToolInputError as e:
             logger.warning("%s rejected: %s", fn.__name__, e)
+            _record_action(fn.__name__, started, "input_error")
             raise
         except CollectionBusyError as e:
             logger.warning("%s in %s", e, fn.__name__)
+            _record_action(fn.__name__, started, "collection_busy")
             raise
         except shrike_native.NativeBusyError as e:
             busy = CollectionBusyError()
             logger.warning("%s in %s", busy, fn.__name__)
+            _record_action(fn.__name__, started, "collection_busy")
             raise busy from e
+        except ServerNotReadyError:
+            _record_action(fn.__name__, started, "not_ready")
+            raise
         except Exception:
             logger.exception("Unhandled error in %s", fn.__name__)
+            _record_action(fn.__name__, started, "internal_error")
             raise
         _log_completed(fn.__name__, kwargs, started)
+        _record_action(fn.__name__, started, "ok")
         return result
 
     wrapper.__doc__ = cleaned_doc
