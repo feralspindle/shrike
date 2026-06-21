@@ -2505,6 +2505,50 @@ pub const FUZZY_MIN_SHARED: usize = 2;
 /// has only a handful of trigrams, all kept). A perf/recall dial.
 pub const FUZZY_MAX_TRIGRAMS: usize = 6;
 
+/// A fast non-cryptographic hasher for the search path's `i64`-keyed maps (rowids,
+/// note-ids). `std`'s default is SipHash — DoS-resistant, but slow on small integer
+/// keys; these maps are internal (keys are our own index rowids/note-ids, never
+/// adversarial input), so the FxHash rotate-xor-multiply is the right trade. The
+/// hash cost shows up directly in the search profile (the fuzzy overlap maps here,
+/// the kernel's RRF score maps), so it is shared. Same logic, faster keys.
+#[derive(Default)]
+pub struct FxI64Hasher(u64);
+
+impl FxI64Hasher {
+    const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+    #[inline]
+    fn add(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(Self::K);
+    }
+}
+
+impl std::hash::Hasher for FxI64Hasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write_i64(&mut self, i: i64) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    // Required, but the i64/u64-keyed maps never reach it; hash byte-wise as a
+    // correct fallback so the type stays a general `Hasher`.
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.add(u64::from(b));
+        }
+    }
+}
+
+/// `HashMap` keyed on `i64` with [`FxI64Hasher`] — the search path's integer-keyed
+/// map type (fuzzy overlap here, RRF score maps in the kernel).
+pub type FxI64Map<V> =
+    std::collections::HashMap<i64, V, std::hash::BuildHasherDefault<FxI64Hasher>>;
+
 pub use shrike_store::LexicalRow;
 
 /// Lowercased char-level trigrams (mirrors the Python `_trigrams`: code-point
@@ -2574,8 +2618,20 @@ impl DerivedEngine {
     fn accumulate_overlap(
         pruned_terms: &[String],
         term_rowids: &std::collections::HashMap<String, Vec<i64>>,
-    ) -> std::collections::HashMap<i64, usize> {
-        let mut overlap: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    ) -> FxI64Map<usize> {
+        // Preallocate to the sum of the rare trigrams' posting lengths — the upper
+        // bound on distinct rowids (a rowid shared across trigrams just over-counts
+        // the bound). Building from empty otherwise grows-and-rehashes the table
+        // repeatedly (the `reserve_rehash` frame in the profile); one sized
+        // allocation skips all of it. The over-allocation is transient — the map is
+        // dropped at the end of the query.
+        let cap: usize = pruned_terms
+            .iter()
+            .filter_map(|t| term_rowids.get(t))
+            .map(Vec::len)
+            .sum();
+        let mut overlap: FxI64Map<usize> =
+            std::collections::HashMap::with_capacity_and_hasher(cap, Default::default());
         for term in pruned_terms {
             if let Some(rowids) = term_rowids.get(term) {
                 for &rid in rowids {
@@ -2600,14 +2656,15 @@ impl DerivedEngine {
     /// it makes a note rank by its best NON-excluded segment, exactly as the JOIN
     /// path does by never counting the excluded ones.
     fn rank_overlap(
-        overlap: &std::collections::HashMap<i64, usize>,
-        seg_meta: &std::collections::HashMap<i64, (i64, String, String)>,
+        overlap: &FxI64Map<usize>,
+        seg_meta: &FxI64Map<(i64, String, String)>,
         top_k: usize,
     ) -> Vec<(i64, String, String, i64)> {
         // Best segment per note: highest overlap, lowest rowid as the deterministic
-        // tie-break (so the chosen snippet segment is stable run to run).
-        let mut best: std::collections::HashMap<i64, (usize, i64)> =
-            std::collections::HashMap::new();
+        // tie-break (so the chosen snippet segment is stable run to run). Sized to
+        // `overlap` (the upper bound on distinct notes) so it never rehashes.
+        let mut best: FxI64Map<(usize, i64)> =
+            std::collections::HashMap::with_capacity_and_hasher(overlap.len(), Default::default());
         for (&rid, &count) in overlap {
             if count < FUZZY_MIN_SHARED {
                 continue;
@@ -2645,7 +2702,7 @@ impl DerivedEngine {
     fn merge_overlap(
         pruned_terms: &[String],
         term_rowids: &std::collections::HashMap<String, Vec<i64>>,
-        seg_meta: &std::collections::HashMap<i64, (i64, String, String)>,
+        seg_meta: &FxI64Map<(i64, String, String)>,
         top_k: usize,
     ) -> Vec<(i64, String, String, i64)> {
         let overlap = Self::accumulate_overlap(pruned_terms, term_rowids);
@@ -2844,13 +2901,12 @@ impl DerivedEngine {
                 .collect()
         } else {
             let term_rowids = Self::fuzzy_term_rowids(&conn, &distinct_terms_vec)?;
-            let overlaps: Vec<std::collections::HashMap<i64, usize>> = pruned
+            let overlaps: Vec<FxI64Map<usize>> = pruned
                 .iter()
                 .map(|p| {
-                    p.as_ref()
-                        .map_or_else(std::collections::HashMap::new, |terms| {
-                            Self::accumulate_overlap(terms, &term_rowids)
-                        })
+                    p.as_ref().map_or_else(FxI64Map::default, |terms| {
+                        Self::accumulate_overlap(terms, &term_rowids)
+                    })
                 })
                 .collect();
             let mut candidates: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
@@ -2919,12 +2975,11 @@ impl DerivedEngine {
         exclude_sources: &[&str],
     ) -> NativeResult<(
         std::collections::HashMap<String, Vec<i64>>,
-        std::collections::HashMap<i64, (i64, String, String)>,
+        FxI64Map<(i64, String, String)>,
     )> {
         let mut term_rowids: std::collections::HashMap<String, Vec<i64>> =
             std::collections::HashMap::new();
-        let mut seg_meta: std::collections::HashMap<i64, (i64, String, String)> =
-            std::collections::HashMap::new();
+        let mut seg_meta: FxI64Map<(i64, String, String)> = FxI64Map::default();
         if terms.is_empty() {
             return Ok((term_rowids, seg_meta));
         }
@@ -3071,9 +3126,11 @@ impl DerivedEngine {
         conn: &Connection,
         rowids: &[i64],
         exclude_sources: &[&str],
-    ) -> NativeResult<std::collections::HashMap<i64, (i64, String, String)>> {
-        let mut seg_meta: std::collections::HashMap<i64, (i64, String, String)> =
-            std::collections::HashMap::new();
+    ) -> NativeResult<FxI64Map<(i64, String, String)>> {
+        // Sized to the candidate set (minus any source-excluded rows) so the
+        // per-candidate inserts never grow-and-rehash the table.
+        let mut seg_meta: FxI64Map<(i64, String, String)> =
+            std::collections::HashMap::with_capacity_and_hasher(rowids.len(), Default::default());
         for chunk in rowids.chunks(Self::INLINE_ID_MAX) {
             let id_list = chunk
                 .iter()
