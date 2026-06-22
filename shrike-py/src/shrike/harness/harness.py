@@ -968,7 +968,7 @@ class Harness:
         batch yield so collection ops interleave. Returns the final report plus
         the run totals (``total_stored``, ``batches``)."""
         started = time.perf_counter()
-        metrics.recognition_running.set(1)
+        metrics.recognition_running.labels(self._metrics_key).set(1)
         result = "ok"
         try:
             report: dict[str, Any] = json.loads(
@@ -978,7 +978,7 @@ class Harness:
             result = "error"
             raise
         finally:
-            metrics.recognition_running.set(0)
+            metrics.recognition_running.labels(self._metrics_key).set(0)
             metrics.recognition_sweeps.labels(result).inc()
             metrics.recognition_duration.labels(result).observe(time.perf_counter() - started)
         total_stored = int(report.get("total_stored", 0))

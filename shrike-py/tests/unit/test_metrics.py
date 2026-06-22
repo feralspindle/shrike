@@ -1,8 +1,6 @@
-"""Prometheus registry shape and native snapshot translation."""
+"""Prometheus registry shape and the appended kernel exposition block."""
 
 from __future__ import annotations
-
-import json
 
 import shrike_native
 from prometheus_client.parser import text_string_to_metric_families
@@ -34,49 +32,36 @@ def test_action_and_http_metrics_use_bounded_labels() -> None:
     assert "a-secret-filename" not in text
 
 
-def test_native_runtime_snapshot_is_exposed(monkeypatch) -> None:
-    histogram = {
-        "count": 2,
-        "sum_seconds": 0.03,
-        "buckets": [[0.01, 1], [0.1, 2]],
-    }
-    snapshot = {
-        "io_alive": True,
-        "collection": {
-            "workers": 1,
-            "queued": 2,
-            "active": 1,
-            "completed": 2,
-            "queue_wait": histogram,
-            "job_duration": histogram,
-        },
-        "compute": {
-            "workers": 4,
-            "queued": 3,
-            "active": 2,
-            "completed": 2,
-            "queue_wait": histogram,
-            "job_duration": histogram,
-        },
-        "embedding": {
-            "text": {
-                "calls": 2,
-                "items": 9,
-                "errors": 1,
-                "duration": histogram,
-            },
-            "image": {},
-        },
-    }
-    monkeypatch.setattr(shrike_native, "runtime_metrics_json", lambda: json.dumps(snapshot))
+def test_kernel_block_is_appended(monkeypatch) -> None:
+    # The kernel's Prometheus exporter renders its own block; /metrics appends it
+    # after the Python registry. Disjoint name prefixes keep the concatenation a
+    # single valid exposition.
+    block = (
+        "# HELP shrike_runtime_pool_workers Live workers driving a pool.\n"
+        "# TYPE shrike_runtime_pool_workers gauge\n"
+        'shrike_runtime_pool_workers{pool="compute"} 4\n'
+    )
+    monkeypatch.setattr(shrike_native, "render_prometheus", lambda: block)
 
     body, _ = Metrics().render()
-    samples = _samples(body.decode())
-    assert samples["shrike_runtime_io_alive[]"] == 1
-    assert samples["shrike_runtime_compute_overlap_ratio[]"] == 0.5
-    assert samples["shrike_runtime_pool_queue_depth[('pool', 'compute')]"] == 3
-    assert samples["shrike_embedding_items_total[('modality', 'text')]"] == 9
-    assert samples["shrike_embedding_batches_total[('modality', 'text'), ('result', 'error')]"] == 1
+    text = body.decode()
+    samples = _samples(text)
+    # Both halves are present and parse as one exposition: the appended kernel
+    # block and the Python registry's own families (HELP emitted via auto_describe).
+    assert samples["shrike_runtime_pool_workers[('pool', 'compute')]"] == 4
+    assert "shrike_action_requests" in text
+
+
+def test_render_tolerates_absent_kernel_block(monkeypatch) -> None:
+    # A compute-only build (no anki-core) or a render failure must not break
+    # /metrics — the Python registry still renders on its own.
+    def _boom() -> str:
+        raise RuntimeError("no kernel exporter")
+
+    monkeypatch.setattr(shrike_native, "render_prometheus", _boom)
+    body, _ = Metrics().render()
+    assert isinstance(body, bytes)
+    assert b"shrike_action_requests" in body
 
 
 def test_index_state_is_one_hot() -> None:
@@ -93,3 +78,10 @@ def test_index_state_is_one_hot() -> None:
 
     assert samples[_state_key("building")] == 1
     assert samples[_state_key("ready")] == 0
+
+
+def test_recognition_running_is_per_collection() -> None:
+    registry = Metrics()
+    registry.recognition_running.labels("default").set(1)
+    samples = _samples(registry.render()[0].decode())
+    assert samples["shrike_recognition_sweep_running[('collection', 'default')]"] == 1

@@ -239,6 +239,9 @@ class CollectionWrapper:
         logger.debug("Opening collection at %s", self._path)
         self.core = CollectionCore(self._path)
         self._open_flag = True
+        # The lock is held from the initial open, not only after a re-acquire —
+        # set the gauge here so the boot hold is covered, cleared on release/close.
+        metrics.lock_held.labels(self._metrics_key).set(1)
         logger.debug("Collection opened successfully")
 
     def set_acquire_hook(self, hook: Callable[[CollectionCore], None] | None) -> None:
@@ -395,6 +398,7 @@ class CollectionWrapper:
         except shrike_native.NativeBusyError as e:
             raise CollectionBusyError() from e
         self._open_flag = True
+        metrics.lock_held.labels(self._metrics_key).set(1)
         logger.info("Reopened collection at %s", self._path)
 
     def close(self) -> None:
@@ -411,6 +415,8 @@ class CollectionWrapper:
         logger.debug("Closing collection")
         with contextlib.suppress(Exception):
             self._executor.submit(self.core.close).result()
+        self._open_flag = False
+        metrics.lock_held.labels(self._metrics_key).set(0)
         self._executor.shutdown(wait=True)
 
     # -- info / read -----------------------------------------------------------

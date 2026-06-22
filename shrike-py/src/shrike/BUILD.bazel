@@ -86,8 +86,9 @@ py_library(
     deps = [":pkg"],
 )
 
-# The process-local Prometheus metrics registry. Leaf-ish: the native runtime
-# snapshot (runtime_metrics_json) is read through the binding at scrape time.
+# The process-local Prometheus metrics registry. Leaf-ish: the kernel's
+# Prometheus block (render_prometheus) is read through the binding and appended
+# at scrape time.
 py_library(
     name = "observability",
     srcs = [
