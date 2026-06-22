@@ -43,6 +43,14 @@ OnDuplicate = Literal["error", "skip", "allow"]
 
 T = TypeVar("T")
 
+# The ``collection`` metric label for the boot collection. A reserved sentinel,
+# NOT "default": a routed registry profile may legitimately be named "default",
+# and sharing the label would collapse two distinct collections (different files)
+# into one series. Routed harnesses pass their profile name; only the boot
+# collection takes this default — the cardinality contract keeps one series per
+# collection.
+BOOT_COLLECTION_KEY = "__boot__"
+
 # Default seconds to hold the collection open after the last operation before
 # releasing the lock, in cooperative mode. Near SQLite's conventional
 # ``busy_timeout``; short because holding blocks launching Anki and re-opening is
@@ -185,7 +193,7 @@ class CollectionWrapper:
         self._on_acquire = on_acquire
         self._open_flag = False
         self._release_handle: asyncio.TimerHandle | None = None
-        self._metrics_key = "default"
+        self._metrics_key = BOOT_COLLECTION_KEY
         # Standalone mode (tests, library use): the wrapper owns the worker
         # thread. The server uses `over_kernel` instead, where the kernel's
         # injected executor is the one serialization domain.
@@ -207,7 +215,7 @@ class CollectionWrapper:
         *,
         cooperative: bool = False,
         hold_seconds: float = DEFAULT_LOCK_HOLD,
-        collection_key: str = "default",
+        collection_key: str = BOOT_COLLECTION_KEY,
     ) -> CollectionWrapper:
         """The server's mode: wrap the kernel's OWN collection.
 
@@ -228,10 +236,13 @@ class CollectionWrapper:
         self._release_handle = None
         self._kernel = kernel
         self._executor = None
-        # The ``collection`` label for this wrapper's lock_held gauge — "default"
-        # for the boot collection, the registry profile name for a routed one.
+        # The ``collection`` label for this wrapper's lock_held gauge — the boot
+        # sentinel for the boot collection, the registry profile name for a routed one.
         self._metrics_key = collection_key
         self.core = kernel.core_handle()
+        # The kernel opens its collection at boot — the lock is held from here,
+        # so the gauge starts at 1 (not 0 until the first status/index op).
+        metrics.lock_held.labels(self._metrics_key).set(1)
         atexit.register(self.close)
         return self
 
@@ -411,6 +422,8 @@ class CollectionWrapper:
         if self._executor is None:
             # Kernel mode: the kernel owns the collection — its close()
             # (driven by the server's shutdown path) closes the core.
+            self._open_flag = False
+            metrics.lock_held.labels(self._metrics_key).set(0)
             return
         logger.debug("Closing collection")
         with contextlib.suppress(Exception):

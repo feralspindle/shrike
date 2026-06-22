@@ -770,6 +770,17 @@ def _register_custom_routes(
             action_started = time.perf_counter()
             name = request.path_params.get("name", "")
 
+            def _input_error(
+                metric_name: str, code: ActionErrorCode, message: str, status: int
+            ) -> JSONResponse:
+                # One place for the HTTP edge's input-error bookkeeping: record the
+                # rejection (input_error, matching the MCP transport) and build the
+                # typed error response. Collapses the early-return copy-paste.
+                metrics.observe_action(
+                    metric_name, "http", "input_error", time.perf_counter() - action_started
+                )
+                return _action_error(code, message, status)
+
             # Wire-version handshake: an optional request wire-version header must
             # match the server's. A mismatch is refused before the op runs — the
             # minimum a separately-shipped client needs to fail fast on a fabric
@@ -780,13 +791,8 @@ def _register_custom_routes(
                 # that never reach _safe_tool (the route line in _guard is DEBUG
                 # for /actions/*).
                 logger.info("action %s rejected: wire version %r", name, requested)
-                metrics.observe_action(
+                return _input_error(
                     name if name in action_tools else "unknown",
-                    "http",
-                    "input_error",
-                    time.perf_counter() - action_started,
-                )
-                return _action_error(
                     ActionErrorCode.INPUT_ERROR,
                     f"Unsupported wire protocol version {requested!r}; "
                     f"this server speaks {WIRE_PROTOCOL_VERSION}.",
@@ -796,10 +802,8 @@ def _register_custom_routes(
             tool = action_tools.get(name)
             if tool is None:
                 logger.info("action %s -> unknown_action (404)", name)
-                metrics.observe_action(
-                    "unknown", "http", "input_error", time.perf_counter() - action_started
-                )
-                return _action_error(
+                return _input_error(
+                    "unknown",
                     ActionErrorCode.UNKNOWN_ACTION,
                     f"No action named {name!r}.",
                     404,
@@ -814,20 +818,16 @@ def _register_custom_routes(
                     parsed = await request.json()
                 except Exception:
                     logger.info("action %s rejected: malformed JSON body", name)
-                    metrics.observe_action(
-                        name, "http", "input_error", time.perf_counter() - action_started
-                    )
-                    return _action_error(
+                    return _input_error(
+                        name,
                         ActionErrorCode.INPUT_ERROR,
                         "Request body must be a JSON object of the action's arguments.",
                         400,
                     )
                 if not isinstance(parsed, dict):
                     logger.info("action %s rejected: body is not a JSON object", name)
-                    metrics.observe_action(
-                        name, "http", "input_error", time.perf_counter() - action_started
-                    )
-                    return _action_error(
+                    return _input_error(
+                        name,
                         ActionErrorCode.INPUT_ERROR,
                         "Request body must be a JSON object of the action's arguments.",
                         400,
@@ -862,10 +862,7 @@ def _register_custom_routes(
                         409,
                     )
                 if isinstance(cause, ValidationError):
-                    metrics.observe_action(
-                        name, "http", "input_error", time.perf_counter() - action_started
-                    )
-                    return _action_error(ActionErrorCode.INPUT_ERROR, str(cause), 400)
+                    return _input_error(name, ActionErrorCode.INPUT_ERROR, str(cause), 400)
                 if isinstance(cause, ServerNotReadyError):
                     # The readiness gate timed out — a transient "still starting"
                     # state, not a bug. _safe_tool already recorded the action as

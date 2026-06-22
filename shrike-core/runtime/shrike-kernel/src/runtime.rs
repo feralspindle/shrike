@@ -268,6 +268,11 @@ pub fn embed_scope<F: Future>(
 /// are independent counter series (`result="ok"` / `result="error"`), never a
 /// subtraction — a concurrent scrape can't observe a non-monotonic derived count.
 pub fn record_embedding(modality: &str, items: usize, elapsed: Duration, success: bool) {
+    if items == 0 {
+        // An empty batch does no work — counting it inflates the batch/items
+        // totals and biases the latency histogram low.
+        return;
+    }
     let (space, operation) = EMBED_CONTEXT
         .try_with(|c| (c.space.clone(), c.operation))
         .unwrap_or_else(|_| ("unknown".to_owned(), "unknown"));

@@ -25,7 +25,7 @@ from typing import Any
 import shrike_native
 
 from shrike.harness import cache_layout
-from shrike.harness.collection import CollectionWrapper
+from shrike.harness.collection import BOOT_COLLECTION_KEY, CollectionWrapper
 from shrike.harness.derived import DerivedTextStore, NativeDerivedEngine
 from shrike.harness.engines.embedding.base import EmbedderBackend
 from shrike.harness.engines.embedding.runtime import EmbeddingRuntime
@@ -258,7 +258,7 @@ class Harness:
         secondary_runtimes: Sequence[EmbeddingRuntime] | None = None,
         cross_space_floor_margin: float = ACTIVATION_MARGIN,
         shared_llama_manager: Any = None,
-        collection_key: str = "default",
+        collection_key: str = BOOT_COLLECTION_KEY,
     ) -> None:
         self.kernel = kernel
         self.wrapper = wrapper
@@ -347,7 +347,7 @@ class Harness:
         secondary_runtimes: Sequence[EmbeddingRuntime] | None = None,
         cross_space_floor_margin: float = ACTIVATION_MARGIN,
         shared_llama_manager: Any = None,
-        collection_key: str = "default",
+        collection_key: str = BOOT_COLLECTION_KEY,
     ) -> Harness:
         """Open the kernel on the running loop. Scheduling is the kernel's own
         (the owned tokio runtime spawns the collection actor); the harness

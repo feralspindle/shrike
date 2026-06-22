@@ -26,6 +26,7 @@ from typing import Any
 import shrike_native
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.tools.base import Tool
+from pydantic import ValidationError
 
 from shrike.api.actions import (
     CONTROL_PLANE_ACTIONS,
@@ -233,6 +234,38 @@ def _bound_impl(action: ActionDef, readiness: ReadinessGate | None) -> Any:
     return _safe_tool(_gate_ready(action.impl, gate))
 
 
+def _instrument_tool_manager(mcp: FastMCP) -> None:
+    """Count an MCP-transport **validation rejection** as ``input_error``.
+
+    FastMCP validates a call's arguments inside ``Tool.run`` (``fn_metadata``),
+    BEFORE the ``_safe_tool``-wrapped impl runs — so a bad/out-of-range argument
+    raises a pydantic ``ValidationError`` (wrapped in ``ToolError``) that never
+    reaches ``_record_action``. The HTTP edge records that case as ``input_error``;
+    without this the two transports disagree. Wrap the tool manager's ``call_tool``
+    (the single seam every MCP ``tools/call`` flows through) to record it, with
+    the ``mcp`` transport from the ContextVar. Impl-path outcomes are already
+    recorded by ``_safe_tool``, so only the pre-impl validation gap is filled.
+    Idempotent — wrapping once per manager.
+    """
+    manager = mcp._tool_manager
+    if getattr(manager, "_shrike_instrumented", False):
+        return
+    original_call_tool = manager.call_tool
+
+    async def call_tool(name: str, arguments: dict[str, Any], **kwargs: Any) -> Any:
+        started = time.perf_counter()
+        try:
+            return await original_call_tool(name, arguments, **kwargs)
+        except Exception as exc:
+            cause = exc.__cause__ if exc.__cause__ is not None else exc
+            if isinstance(cause, ValidationError):
+                _record_action(name, started, "input_error")
+            raise
+
+    manager.call_tool = call_tool  # type: ignore[assignment]
+    manager._shrike_instrumented = True  # type: ignore[attr-defined]
+
+
 def register_actions(
     mcp: FastMCP, actions: list[ActionDef], readiness: ReadinessGate | None = None
 ) -> None:
@@ -240,6 +273,7 @@ def register_actions(
     ``mcp.tool()`` over the ``_safe_tool``-wrapped, readiness-gated impl)."""
     for action in actions:
         mcp.tool()(_bound_impl(action, readiness))
+    _instrument_tool_manager(mcp)
 
 
 def build_action_tools(
