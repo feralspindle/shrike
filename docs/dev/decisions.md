@@ -672,6 +672,130 @@ unauthenticated from the network*, regardless of how the data plane is exposed.
   front of the loopback-TCP listener) and the management-pane subdomain are out of scope here — they
   are the authn/authz and management-UI tracks. This decision is the transport split they build on.
 
+## Security
+
+### The SSRF classifier over-refuses v4-in-v6 forms, beyond CPython `is_global` parity
+
+The `ip_is_allowed` classifier (`shrike-network`) is parity-tested against Python's
+`ipaddress.is_global`, but on two IPv6 forms it deliberately diverges and refuses
+what `is_global` would permit:
+
+- **IPv4-compatible `::a.b.c.d` (`::/96`, RFC 4291 §2.5.5.1, deprecated)** — `is_global`
+  treats it as global, but it embeds a v4 the OS may route to (`::127.0.0.1`), and
+  unlike the v4-mapped `::ffff:` block, `to_ipv4_mapped()` does not defer it to the v4
+  classifier. Refused wholesale (#1008).
+- **NAT64 well-known `64:ff9b::/96` (RFC 6052)** — embeds a v4 in the low 32 bits; on a
+  network with a NAT64 gateway, `64:ff9b::<internal-v4>` reaches that internal v4.
+  Refused wholesale.
+
+The stance is **over-refuse**: even a *public* embedded v4 (`::8.8.8.8`,
+`64:ff9b::8.8.8.8`) is refused. These are deprecated/translation forms with no
+legitimate attacker-supplied-fetch use, so refusing the whole block is simpler and
+strictly safer than per-embedded-v4 deferral, and it can never under-refuse. The
+v4-mapped `::ffff:` block is the one exception that *keeps* deferring to the embedded
+v4 (legitimately returned by dual-stack resolvers; it already refuses internal mapped
+v4s). Because this diverges from raw `is_global`, the Python parity test's reference
+(`_python_allowed`) encodes the same hardening — the test pins "native matches our
+hardened classifier," not raw `is_global`. Operator-chosen NAT64 NSPs (any /96…/32 a
+site picks) are unknowable and out of scope.
+
+## Testing
+
+### The Rust unit bar: API-level, adversarial, no integration backstop
+
+The kernel's integration suite (Python) is genuinely strong, and the early Rust
+tests were written *assuming* it backstops them — cursory in-module smoke tests.
+That assumption capped unit-test quality. The bar is reset: each crate gets
+fast, exhaustive tests **directly against its public API**, adversarial by
+construction (boundaries, negative cases, malformed input, ordering, idempotence,
+oracle cross-checks), standing on their own rather than leaning on end-to-end
+coverage. The per-category taxonomy (unit / property / oracle-differential /
+fuzz-style / in-crate integration) and where each lives are in
+[`testing.md`](testing.md).
+
+### Property/generative tests use `proptest`
+
+Property-based and fuzz-style inline tests use `proptest`: generated inputs via
+`Strategy`, the `proptest!` macro, model-based oracle traces (a generated `Vec`
+of ops replayed against a `BTreeMap`/`BTreeSet` reference), and `prop_assert_eq!`.
+The win over a hand-rolled generator is **automatic shrinking** — a failure is
+reduced to a minimal witness (the shortest op trace, the smallest `(a, b)` pair)
+instead of a raw seed a human must minimize by hand.
+
+This reverses an earlier interim decision to inline a SplitMix64 PRNG. That choice
+existed for one reason: a build constraint. The authoritative lane is Bazel, whose
+`crate_universe` resolves every dependency — dev/test crates included — from one
+`Cargo.lock` into `MODULE.bazel.lock`, so adding a test framework is a crate-graph
+change that needs a `./bazel` re-splice, not a bare `Cargo.toml` edit. The interim
+session could not run Bazel, so it could not adopt the dep; the inlined generator
+was the zero-churn stand-in. With Bazel in reach the constraint is gone, the dep is
+adopted properly, and the cost is small: `proptest` pulls in six leaf crates
+(`proptest`, `rusty-fork`, `quick-error`, `rand_xorshift`, `unarray`,
+`wait-timeout`), reusing the `rand`/`regex` already in the graph.
+
+Adoption mechanics, for the record (and for adding it to a new crate):
+`proptest = "1"` in the workspace `[workspace.dependencies]`; `proptest =
+{ workspace = true }` in the crate's `[dev-dependencies]`; `@crates//:proptest` in
+the crate's `rust_test` `deps`; then a `./bazel` run re-splices `MODULE.bazel.lock`.
+The first adoption regenerates the lock; later crates ride the already-resolved
+graph (no further lock change).
+
+- **`cargo-fuzz`/`libFuzzer`** stays a **cargo-only** tool, off the per-PR `bazel
+  test //...` critical path (slow, own toolchain) — a scheduled/manual lane added
+  when a decode/parse boundary's value justifies it; the `proptest` panic-freedom
+  sweeps cover the common case until then.
+- **miri was evaluated for FFI soundness (#744) and found NOT viable for the
+  binding crates.** miri interprets MIR and cannot execute foreign code — and the
+  `shrike-cabi`/`shrike-pyo3` dependency cone is exactly that: a tokio runtime
+  (real syscalls), usearch (linked C++ via cxx), anki, and the CPython FFI. miri
+  runs cleanly on a pure-Rust crate (verified on `shrike-store`) but a `cargo miri
+  test` on cabi/pyo3 dies the moment a test touches the runtime or a C/C++ symbol,
+  and the pure-Rust crates miri *can* run carry almost no `unsafe` to check. So
+  there is no useful miri lane to stand up here. FFI soundness is instead pinned
+  **behaviourally, under real execution**: the six `shrike-cabi` integration
+  binaries (C-ABI lifecycle, panic-across-boundary, fire-once, op-racing-shutdown,
+  post-shutdown, reinit, no-driven-runtime) plus the Python `native` suite
+  (ErrorKind→PyException mapping, the facades, teardown). A future miri pass would
+  need the cabi pointer/lifetime helpers (`cstr`, `UserData`, `Completion`,
+  `ShrikeHandle`) factored into a C-stack-free unit so miri has something to run.
+- **Hermeticity is non-negotiable in the unit lane.** A property/fuzz test sweeps
+  inputs through *pure* code only — it must not perform live I/O (no `getaddrinfo`,
+  no sockets, no disk beyond a tempdir). The SSRF classifier is fuzzed as the pure
+  `ip_is_allowed`; the resolve-then-vet path that calls the system resolver is an
+  end-to-end concern, not a unit-lane sweep.
+
+### Coverage is measured for BOTH languages, reported never gated
+
+Coverage is two numbers from two tools, neither on the per-PR critical path and
+neither a build gate:
+
+- **Python** — `coverage.py` (branch mode) over the unit + non-embedding
+  integration suites, via `scripts/coverage.sh`. The spawned-server subprocess is
+  captured through a committed `.pth` hook (a plain `--cov` misses it — see the
+  Bazel-coverage-subprocess note below). ~87%.
+- **Rust** — `cargo-llvm-cov` (line + region) over the `shrike-core` workspace, via
+  `scripts/coverage-rust.sh`. It excludes the binding crates (`shrike-pyo3`,
+  `shrike-cabi`): their thin Rust unit tests would dilute the kernel/store/engine
+  number, and their real contract is the FFI boundary the Python `native` suite and
+  the scheduled miri lane cover. ~90%.
+
+Both are **cargo/pip concerns, not Bazel** — `bazel coverage` can't see the spawned
+server subprocess and its Rust-coverage path is a deferred follow-up, so each
+language's native coverage tool owns its number. The CI `Coverage` workflow runs
+both off the per-PR path (push-to-main + rc PR + manual dispatch) and publishes the
+Python badge; it reports tables to the run summary and **never fails a build on a
+threshold**.
+
+**Gating posture: deliberately off-gate** (revisited under the "free CI" framing and
+kept). A hard coverage gate makes an unrelated PR fail on coverage *noise* — a
+refactor that deletes a covered branch, a line only reachable on another platform,
+a flaky-skipped test — turning a health signal into brittle friction. The number's
+value is the *trend*, surfaced on every main merge via the badge. The floors are
+**local ratchets**, not gates: Python's `fail_under` in `pyproject.toml` (enforced
+only by `scripts/coverage.sh`), and Rust's `scripts/coverage-rust.sh
+--fail-under-lines N`. Ratchet them up as coverage climbs; never lower one to make a
+run pass.
+
 ## Performance engineering
 
 ### Stub-vs-real embedding is a profile choice, via a first-class `synthetic` runtime (#865)

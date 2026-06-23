@@ -468,6 +468,7 @@ pub fn which(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::path::PathBuf;
 
     /// A minimal in-test policy: no real binary, a sleeper argv, configurable
@@ -793,5 +794,359 @@ mod tests {
         assert!(!s.running());
         // It waited out SHUTDOWN_TIMEOUT before the kill tier.
         assert!(started.elapsed() >= SHUTDOWN_TIMEOUT);
+    }
+
+    // ---- Adversarial lifecycle tests (#744) ----
+    //
+    // A leaked/zombied child or a mis-reap is an operational hazard: every test
+    // below pins one corner of the spawn → health-wait → stop / reap state
+    // machine with a fully controllable in-test policy, never a real model
+    // binary. The health probe is driven by atomics so a test owns exactly when
+    // the process reads healthy, and exit-paths use short-lived commands
+    // (`/bin/true`, `/bin/sleep 0`) so the suite stays fast and hermetic.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A controllable policy: a caller-chosen binary+argv and a health probe
+    /// whose readiness is data-driven (becomes true on the Nth poll). This
+    /// exercises the generic `start()` lifecycle without a real server.
+    struct CtrlPolicy {
+        binary: String,
+        args: Vec<String>,
+        port: u16,
+        pid_file: Option<PathBuf>,
+        /// Health returns true once `polls` reaches `healthy_after`.
+        polls: AtomicUsize,
+        healthy_after: usize,
+    }
+
+    impl CtrlPolicy {
+        fn new(binary: &str, args: &[&str], port: u16, healthy_after: usize) -> Self {
+            Self {
+                binary: binary.into(),
+                args: args.iter().map(|s| (*s).into()).collect(),
+                port,
+                pid_file: None,
+                polls: AtomicUsize::new(0),
+                healthy_after,
+            }
+        }
+    }
+
+    impl ManagedProcess for CtrlPolicy {
+        fn binary(&self) -> NativeResult<String> {
+            if self.binary.is_empty() {
+                return Err(NativeError::unavailable("ctrl: no binary"));
+            }
+            Ok(self.binary.clone())
+        }
+        fn argv(&self, binary: &str) -> Vec<String> {
+            let mut v = vec![binary.to_string()];
+            v.extend(self.args.iter().cloned());
+            v
+        }
+        fn host(&self) -> &str {
+            "127.0.0.1"
+        }
+        fn port(&self) -> u16 {
+            self.port
+        }
+        fn pid_file(&self) -> Option<&Path> {
+            self.pid_file.as_deref()
+        }
+        fn health_check(&self, _base_url: &str) -> bool {
+            let n = self.polls.fetch_add(1, Ordering::SeqCst);
+            n >= self.healthy_after
+        }
+        fn process_name(&self) -> &str {
+            "ctrl-process"
+        }
+    }
+
+    // 1. Happy path: spawn → immediately healthy → ready, with the observed PID
+    //    mirrored in the cell. `start()` must return Ok and leave a live child.
+    #[cfg(unix)]
+    #[test]
+    fn start_spawns_and_reaches_ready_when_healthy() {
+        let mut s = Supervisor::new(CtrlPolicy::new("/bin/sleep", &["30"], 18401, 0));
+        let cell = s.pid_cell();
+        s.start().expect("a healthy process must start");
+        assert!(
+            s.running(),
+            "the child must be alive after a successful start"
+        );
+        let pid = s.pid().expect("a started supervisor exposes its PID");
+        assert_eq!(
+            *cell.lock().unwrap(),
+            Some(pid),
+            "the observed PID is mirrored in the non-blocking cell"
+        );
+        s.stop();
+        assert!(!s.running());
+    }
+
+    // 1. Health flap: the probe fails on its first polls then passes within the
+    //    window — `start()` must keep polling and succeed (not give up on the
+    //    first false). Pins the poll-until-healthy loop.
+    #[cfg(unix)]
+    #[test]
+    fn start_succeeds_when_health_flaps_then_passes() {
+        // Healthy only on the 3rd poll: the first two are false.
+        let mut s = Supervisor::new(CtrlPolicy::new("/bin/sleep", &["30"], 18402, 2));
+        s.start()
+            .expect("a process that becomes healthy mid-window must start");
+        assert!(s.running());
+        s.stop();
+        assert!(!s.running());
+    }
+
+    // 1. Process exits immediately: spawn succeeds but the child is gone before
+    //    health can pass. `wait_healthy` must observe `!running` and bail FAST
+    //    (not wait out the 30s HEALTH_TIMEOUT), and `start()` must return an
+    //    Unavailable error carrying the exit code (`sleep 0` → 0).
+    #[cfg(unix)]
+    #[test]
+    fn start_errors_fast_when_process_exits_before_healthy() {
+        // healthy_after huge so health never trips; `sleep 0` exits ~instantly
+        // with code 0. (`/bin/sleep` is present on Linux and macOS; `/bin/true`
+        // is not — macOS ships it at /usr/bin/true.)
+        let mut s = Supervisor::new(CtrlPolicy::new("/bin/sleep", &["0"], 18403, usize::MAX));
+        let started = Instant::now();
+        let err = s
+            .start()
+            .expect_err("an immediately-exiting process must fail to start");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must bail on observed exit, not wait out the 30s health timeout (took {:?})",
+            started.elapsed()
+        );
+        assert_eq!(err.kind(), ErrorKind::Unavailable);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exit code: 0"),
+            "the error must report the child's real exit code; got {msg:?}"
+        );
+        assert!(!s.running(), "no live child remains after a failed start");
+        assert!(
+            s.pid().is_none(),
+            "the child handle was taken on the failed start"
+        );
+    }
+
+    // 1. Binary resolution failure: the policy cannot resolve a binary →
+    //    Unavailable, and nothing is spawned (no leaked handle, no pid mirror).
+    #[test]
+    fn start_errors_when_binary_unresolvable_and_spawns_nothing() {
+        let mut s = Supervisor::new(CtrlPolicy::new("", &[], 18404, 0));
+        let err = s
+            .start()
+            .expect_err("an unresolvable binary must fail to start");
+        assert_eq!(err.kind(), ErrorKind::Unavailable);
+        assert!(s.pid().is_none(), "no child handle on a resolution failure");
+        assert_eq!(
+            *s.pid_cell().lock().unwrap(),
+            None,
+            "the PID cell stays empty when nothing spawned"
+        );
+    }
+
+    // 1. A spawn of a nonexistent path is an Unavailable error (the `.context`
+    //    on `Command::spawn`), not a panic — the binary resolved to a string but
+    //    exec failed.
+    #[cfg(unix)]
+    #[test]
+    fn start_errors_when_spawn_fails_for_a_missing_executable() {
+        let mut s = Supervisor::new(CtrlPolicy::new(
+            "/nonexistent/shrike/definitely-not-here",
+            &[],
+            18405,
+            0,
+        ));
+        let err = s
+            .start()
+            .expect_err("a missing executable must fail to spawn");
+        assert_eq!(err.kind(), ErrorKind::Unavailable);
+        assert!(s.pid().is_none());
+    }
+
+    // 1. Idempotent start: calling `start()` on an already-running supervisor is
+    //    a no-op early-return Ok, and does NOT replace the live child (the PID is
+    //    stable — a double-spawn would leak the first one).
+    #[cfg(unix)]
+    #[test]
+    fn start_is_idempotent_for_an_already_running_child() {
+        let mut s = Supervisor::new(CtrlPolicy::new("/bin/sleep", &["30"], 18406, 0));
+        s.start().unwrap();
+        let pid1 = s.pid().unwrap();
+        s.start()
+            .expect("a second start while running is a no-op Ok");
+        let pid2 = s.pid().unwrap();
+        assert_eq!(
+            pid1, pid2,
+            "the running child must not be replaced (no leak)"
+        );
+        s.stop();
+    }
+
+    // 2. Double-stop is idempotent: a second stop with no child must not panic
+    //    and must leave the supervisor in the stopped state. Also stop-before-
+    //    ready (no child ever spawned) is a clean no-op.
+    #[cfg(unix)]
+    #[test]
+    fn stop_is_idempotent_and_safe_with_no_child() {
+        let mut s = supervisor(18407);
+        // Stop before anything spawned — a no-op, no panic.
+        s.stop();
+        assert!(!s.running());
+        // Spawn, stop, then stop again — the second stop is a clean no-op.
+        s.child = Some(Command::new("/bin/sleep").arg("30").spawn().unwrap());
+        s.stop();
+        assert!(!s.running());
+        s.stop();
+        assert!(!s.running());
+    }
+
+    // 2. Drop must reap the child — a dropped supervisor that leaks its process
+    //    is the core operational hazard. Spawn a detached-observable child,
+    //    capture its PID, drop the supervisor, and assert the OS no longer sees
+    //    the PID alive.
+    #[cfg(unix)]
+    #[test]
+    fn drop_reaps_the_child_so_it_does_not_leak() {
+        let pid = {
+            let mut s = supervisor(18408);
+            s.child = Some(Command::new("/bin/sleep").arg("30").spawn().unwrap());
+            let pid = s.pid().unwrap() as i64;
+            assert!(pid_alive(pid), "child is alive before drop");
+            pid
+            // s dropped here → Drop::drop must stop the child.
+        };
+        // After drop the child must be dead (Drop waited it via stop()). A
+        // direct child becomes a zombie until waited, but stop() inside Drop
+        // does the wait, so `kill(pid,0)` should no longer report it. (The probe
+        // is checked immediately; a PID-reuse race in the microsecond window is
+        // theoretically possible but negligible — Linux allocates PIDs
+        // sequentially across a >32k space.)
+        assert!(
+            !pid_alive(pid),
+            "a dropped supervisor must reap its child, not leak it"
+        );
+    }
+
+    // 2. A child that exits on its own BEFORE stop: `stop_observing_exit` must
+    //    report the real exit code (a genuine code, not a signal status) and
+    //    clear the cell and pid file. Pins the "already exited" branch of stop.
+    #[cfg(unix)]
+    #[test]
+    fn stop_reports_natural_exit_code_for_an_already_dead_child() {
+        let dir = std::env::temp_dir().join(format!("shrike-natexit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("process.pid");
+        let mut s = supervisor(18409);
+        s.policy.pid_file = Some(pid_file.clone());
+        // A child that exits 0 on its own; wait for it to actually be reapable.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .unwrap();
+        // Poll until the OS reports it exited so stop sees the "already exited"
+        // branch deterministically.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        s.child = Some(child);
+        s.write_pid_file();
+        let status = s.stop_observing_exit();
+        assert_eq!(
+            status.and_then(|s| s.code()),
+            Some(7),
+            "stop must surface the child's natural exit code"
+        );
+        assert_eq!(*s.pid_cell().lock().unwrap(), None, "the cell is cleared");
+        assert!(!pid_file.exists(), "the pid file is cleared on stop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 3. The reaper is a complete no-op when the policy supplies no pid_file —
+    //    the reaper is disabled, so a running unrelated process must be wholly
+    //    untouched and no kill path is taken.
+    #[cfg(unix)]
+    #[test]
+    fn reap_orphan_is_a_noop_without_a_pid_file() {
+        let s = supervisor(18410); // pid_file defaults to None
+                                   // No panic, no side effects — exercises the early return.
+        s.reap_orphan();
+    }
+
+    // 2/3. start() reaps a stale orphan record BEFORE spawning, then writes a
+    //    fresh pid file holding the new child's PID. Pins the spawn-time
+    //    ordering: a garbage prior record is cleared and replaced atomically by
+    //    the successful start, never left to mis-reap the new child.
+    #[cfg(unix)]
+    #[test]
+    fn start_clears_a_stale_record_then_records_the_new_pid() {
+        let dir = std::env::temp_dir().join(format!("shrike-startrec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("process.pid");
+        std::fs::write(&pid_file, "not-a-pid").unwrap(); // garbage prior record
+        let mut policy = CtrlPolicy::new("/bin/sleep", &["30"], 18411, 0);
+        policy.pid_file = Some(pid_file.clone());
+        let mut s = Supervisor::new(policy);
+        s.start().expect("a healthy process must start");
+        let recorded = std::fs::read_to_string(&pid_file).unwrap();
+        assert_eq!(
+            recorded.trim().parse::<u32>().ok(),
+            s.pid(),
+            "the pid file holds the freshly spawned child's PID"
+        );
+        s.stop();
+        assert!(!pid_file.exists(), "stop clears the record");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 5. `which`/`is_executable` are exposed binary-resolution helpers. A
+    //    well-known executable resolves to an executable absolute path; a
+    //    guaranteed-absent name resolves to None; a non-executable file is not
+    //    executable.
+    #[cfg(unix)]
+    #[test]
+    fn which_and_is_executable_resolve_and_reject() {
+        // /bin/sh is executable on every unix.
+        assert!(is_executable(Path::new("/bin/sh")));
+        let resolved = which("sh").expect("`sh` is on PATH");
+        assert!(is_executable(Path::new(&resolved)));
+        // A name no PATH entry holds resolves to None.
+        assert!(which("shrike-no-such-binary-xyzzy-9999").is_none());
+        // A plain non-executable file is not executable.
+        let dir = std::env::temp_dir().join(format!("shrike-isexec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("plain.txt");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(!is_executable(&f), "a 0644 file is not executable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    proptest! {
+        /// FUZZ: `which` over arbitrary PATH-lookup names must never panic and
+        /// must never spuriously resolve garbage. Names are drawn from printable
+        /// ASCII with `/` mapped away (a `/` would make it a path rather than a
+        /// PATH lookup), so the sweep stays a pure PATH search — no spawn, no live
+        /// I/O. If a junk name DID resolve, the contract still holds: the path
+        /// must actually be executable (never a false positive).
+        #[cfg(unix)]
+        #[test]
+        fn which_never_panics_or_resolves_garbage(
+            name in prop::collection::vec(33u8..127, 0..20).prop_map(|bytes| {
+                bytes
+                    .into_iter()
+                    .map(|c| (if c == b'/' { b'_' } else { c }) as char)
+                    .collect::<String>()
+            })
+        ) {
+            if let Some(p) = which(&name) {
+                prop_assert!(is_executable(Path::new(&p)));
+            }
+        }
     }
 }

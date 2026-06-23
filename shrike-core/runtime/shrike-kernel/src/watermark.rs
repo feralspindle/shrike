@@ -96,6 +96,7 @@ pub struct WatermarkFloors {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn a_clean_write_advances_to_its_captured_col_mod() {
@@ -150,5 +151,132 @@ mod tests {
         f.clear();
         assert_eq!(f.floor(), None);
         assert_eq!(f.resolve(100, true), Some(100));
+    }
+
+    // ── Generative "never over-certifies" property ──────────────────────
+
+    /// One generated op against a [`SpaceFloor`]: either a `resolve(col_mod,
+    /// success)` or a `clear`.
+    #[derive(Debug, Clone)]
+    enum Op {
+        Resolve { col_mod: i64, success: bool },
+        Clear,
+    }
+
+    /// A sequence of ops over a SMALL col_mod space (0..12) so failures and
+    /// successes interleave at the same and adjacent values — the boundary the
+    /// floor guards. `clear` is rare (~1/17) so most ops exercise the
+    /// fail/succeed interplay, matching the original generator's weighting.
+    fn op_sequence() -> impl Strategy<Value = Vec<Op>> {
+        let op = prop_oneof![
+            16 => (0_i64..12, prop::bool::weighted(2.0 / 3.0))
+                .prop_map(|(col_mod, success)| Op::Resolve { col_mod, success }),
+            1 => Just(Op::Clear),
+        ];
+        prop::collection::vec(op, 1..40)
+    }
+
+    proptest! {
+        /// The load-bearing safety invariant (module docs): a watermark may certify
+        /// a col_mod V only when every write with col.mod ≤ V is indexed. Over a
+        /// random op sequence, no `resolve` may return `Some(v)` while an unhealed
+        /// failure sits at col.mod ≤ v — that is the silent-search-loss bug. Pinned
+        /// against an independent oracle of the floor (min unhealed-failure col_mod),
+        /// rebuilt by a different traversal than [`SpaceFloor`] itself.
+        #[test]
+        fn resolve_never_over_certifies_an_unhealed_failure(ops in op_sequence()) {
+            let mut f = SpaceFloor::default();
+            // Independent oracle of the floor (min unhealed-failure col_mod).
+            let mut oracle_floor: Option<i64> = None;
+            for op in ops {
+                let (col_mod, success) = match op {
+                    Op::Clear => {
+                        f.clear();
+                        oracle_floor = None;
+                        continue;
+                    }
+                    Op::Resolve { col_mod, success } => (col_mod, success),
+                };
+
+                let got = f.resolve(col_mod, success);
+
+                // Oracle decision, computed from the floor BEFORE this op folds in.
+                let blocked = matches!(oracle_floor, Some(fl) if fl <= col_mod);
+                let want = if !success || blocked {
+                    None
+                } else {
+                    Some(col_mod)
+                };
+                prop_assert_eq!(got, want, "resolve diverged from the oracle");
+
+                // The safety invariant: a certified value is strictly below any
+                // unhealed failure floor (so no un-indexed note ≤ v is certified).
+                if let Some(v) = got {
+                    prop_assert!(
+                        oracle_floor.is_none() || oracle_floor.unwrap() > v,
+                        "over-certified {} at/above floor {:?}",
+                        v,
+                        oracle_floor
+                    );
+                }
+
+                // Fold the failure into the oracle AFTER the decision (a failure
+                // floors itself and returns None — it can't certify itself).
+                if !success {
+                    oracle_floor = Some(match oracle_floor {
+                        Some(fl) => fl.min(col_mod),
+                        None => col_mod,
+                    });
+                }
+                prop_assert_eq!(f.floor(), oracle_floor, "floor tracking diverged");
+            }
+        }
+
+        /// Directed restatement of the property: after an unhealed failure at F,
+        /// every clean write at col.mod ≥ F is blocked, every write strictly
+        /// below F certifies itself, and only clear() reopens F and above.
+        #[test]
+        fn once_floored_no_value_at_or_above_certifies_until_clear(
+            fail_at in 0_i64..50,
+            probes in prop::collection::vec(0_i64..60, 10),
+        ) {
+            let mut f = SpaceFloor::default();
+            f.resolve(fail_at, false);
+            for v in probes {
+                let got = f.resolve(v, true);
+                if v < fail_at {
+                    prop_assert_eq!(got, Some(v), "below the floor must self-certify");
+                } else {
+                    prop_assert_eq!(got, None, "at/above the floor must stay blocked");
+                }
+            }
+            f.clear();
+            let v = fail_at + 5;
+            prop_assert_eq!(f.resolve(v, true), Some(v), "clear reopens at/above F");
+        }
+    }
+
+    #[test]
+    fn index_and_derived_floors_are_independent() {
+        // The two spaces fail independently: an index-tail failure must not
+        // block the derived watermark, and vice versa.
+        let mut wf = WatermarkFloors::default();
+        assert_eq!(wf.index.resolve(100, false), None);
+        // derived saw no failure → it still certifies at/above 100.
+        assert_eq!(wf.derived.resolve(100, true), Some(100));
+        assert_eq!(wf.derived.resolve(200, true), Some(200));
+        // index is still floored.
+        assert_eq!(wf.index.resolve(200, true), None);
+        // Clearing one space leaves the other's floor intact.
+        let mut wf2 = WatermarkFloors::default();
+        wf2.index.resolve(50, false);
+        wf2.derived.resolve(60, false);
+        wf2.index.clear();
+        assert_eq!(wf2.index.resolve(70, true), Some(70));
+        assert_eq!(
+            wf2.derived.resolve(70, true),
+            None,
+            "derived floor survives"
+        );
     }
 }
