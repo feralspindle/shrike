@@ -477,10 +477,18 @@ impl DerivedEngine {
     const TRIGRAM_DF_DDL: &'static str =
         "CREATE TABLE IF NOT EXISTS trigram_df(term TEXT PRIMARY KEY, df INTEGER NOT NULL)";
 
+    /// One serialized roaring bitmap per trigram — the posting over idx
+    /// rowids, materialized at build by [`Self::refresh_trigram_bitmaps`]. The fuzzy
+    /// candidate read loads the pruned trigrams' bitmaps from here instead of
+    /// re-scanning their FTS5 doclists.
+    const TRIGRAM_BITMAP_DDL: &'static str =
+        "CREATE TABLE IF NOT EXISTS trigram_bitmap(term TEXT PRIMARY KEY, bm BLOB NOT NULL)";
+
     fn create_tables(conn: &Connection) -> NativeResult<()> {
         conn.execute(Self::IDX_DDL, []).map_err(db_err)?;
         conn.execute(Self::IDX_VOCAB_DDL, []).map_err(db_err)?;
         conn.execute(Self::TRIGRAM_DF_DDL, []).map_err(db_err)?;
+        conn.execute(Self::TRIGRAM_BITMAP_DDL, []).map_err(db_err)?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS rowmap(\
              rowid INTEGER PRIMARY KEY, note_id INTEGER NOT NULL, \
@@ -728,6 +736,22 @@ impl DerivedEngine {
         Ok(())
     }
 
+    /// Advance the monotonic derived write generation — the freshness signal the
+    /// bitmap path checks. Every text write (ingest/remove) bumps it, so a build
+    /// stamps the generation it covered and a later query detects ANY write since
+    /// (see [`Self::bitmaps_fresh`]). A counter, NOT a max-rowid high-water mark:
+    /// FTS5 reuses a freed rowid, so `max(rowid)` is not monotonic across a
+    /// delete-then-insert — a generation is.
+    fn bump_write_gen(conn: &Connection) -> NativeResult<()> {
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('write_gen', 1) \
+             ON CONFLICT(key) DO UPDATE SET value = value + 1",
+            [],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Replace a note's text rows for one source (incremental upsert), in one
     /// transaction.
     ///
@@ -744,6 +768,7 @@ impl DerivedEngine {
         let tx = conn.transaction().map_err(db_err)?;
         Self::delete_rows(&tx, &[note_id], Some(source))?;
         Self::insert_rows(&tx, note_id, source, refs_text)?;
+        Self::bump_write_gen(&tx)?;
         tx.commit().map_err(db_err)
     }
 
@@ -779,6 +804,7 @@ impl DerivedEngine {
                 Self::insert_rows(&tx, *note_id, source, refs_text)?;
             }
         }
+        Self::bump_write_gen(&tx)?;
         tx.commit().map_err(db_err)
     }
 
@@ -823,6 +849,7 @@ impl DerivedEngine {
         let tx = conn.transaction().map_err(db_err)?;
         Self::delete_rows(&tx, note_ids, source)?;
         Self::delete_gated(&tx, note_ids, source)?;
+        Self::bump_write_gen(&tx)?;
         tx.commit().map_err(db_err)
     }
 
@@ -936,6 +963,11 @@ impl DerivedEngine {
                 "trigram_df refresh failed; fuzzy prune will use a stale DF snapshot"
             );
         }
+        // Re-materialize the per-trigram posting bitmaps the fuzzy candidate
+        // read uses; best-effort like the DF refresh.
+        if let Err(e) = self.refresh_trigram_bitmaps() {
+            tracing::warn!(error = %e, "trigram_bitmap refresh failed");
+        }
         Ok(total)
     }
 
@@ -968,6 +1000,103 @@ impl DerivedEngine {
         .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         Ok(())
+    }
+
+    /// Materialize one roaring bitmap per trigram (its posting over idx rowids)
+    /// into `trigram_bitmap`, via ONE term-ordered scan of the index's `instance`
+    /// fts5vocab. A full rebuild, not incremental — a write between rebuilds is
+    /// covered by the freshness gate ([`Self::bitmaps_fresh`]), which routes such a
+    /// query to the live posting read until the next rebuild re-materializes here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vocabulary scan or the table rewrite fails.
+    fn refresh_trigram_bitmaps(&self) -> NativeResult<()> {
+        use roaring::RoaringBitmap;
+        let mut conn = self.lock();
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS idx_vocab_inst USING fts5vocab('idx', 'instance')",
+            [],
+        )
+        .map_err(db_err)?;
+        let tx = conn.transaction().map_err(db_err)?;
+        tx.execute("DELETE FROM trigram_bitmap", [])
+            .map_err(db_err)?;
+        {
+            // `instance` fts5vocab yields (term, doc, col, offset) in term order, so
+            // one scan groups every rowid (`doc`) under its trigram. Duplicate
+            // (term, doc) positions just re-set the same bit (idempotent).
+            let mut sel = tx
+                .prepare("SELECT term, doc FROM idx_vocab_inst")
+                .map_err(db_err)?;
+            let mut ins = tx
+                .prepare("INSERT INTO trigram_bitmap(term, bm) VALUES(?1, ?2)")
+                .map_err(db_err)?;
+            let mut rows = sel.query([]).map_err(db_err)?;
+            let mut cur: Option<String> = None;
+            let mut bm = RoaringBitmap::new();
+            while let Some(r) = rows.next().map_err(db_err)? {
+                let term: String = r.get(0).map_err(db_err)?;
+                let doc: i64 = r.get(1).map_err(db_err)?;
+                if cur.as_deref() != Some(term.as_str()) {
+                    if let Some(prev) = cur.take() {
+                        let mut buf: Vec<u8> = Vec::new();
+                        bm.serialize_into(&mut buf)
+                            .map_err(|e| NativeError::internal(e.to_string()))?;
+                        ins.execute(rusqlite::params![prev, buf]).map_err(db_err)?;
+                        bm.clear();
+                    }
+                    cur = Some(term);
+                }
+                bm.insert(doc as u32);
+            }
+            if let Some(prev) = cur.take() {
+                let mut buf: Vec<u8> = Vec::new();
+                bm.serialize_into(&mut buf)
+                    .map_err(|e| NativeError::internal(e.to_string()))?;
+                ins.execute(rusqlite::params![prev, buf]).map_err(db_err)?;
+            }
+        }
+        // Stamp the write generation these bitmaps cover, so a fuzzy query can
+        // detect ANY write since this build (a higher generation) and fall back to
+        // the live posting read — the bitmaps are a build snapshot.
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('bitmap_built_gen', \
+             COALESCE((SELECT value FROM meta WHERE key='write_gen'), 0))",
+            [],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Whether the precomputed bitmaps still cover the live index: true iff no text
+    /// write has landed since the generation they were built at. A missing stamp
+    /// (never built) reads as stale. The write generation is monotonic across a
+    /// delete-then-insert — unlike a max-rowid watermark, which FTS5 rowid reuse
+    /// lets a delete-heavy-then-insert batch slip under (deleted slots free high
+    /// rowids the inserts reuse, so max never rises), silently hiding the new notes.
+    /// A delete alone is harmless to recall but still bumps the generation, so the
+    /// fallback engages conservatively until the next rebuild.
+    fn bitmaps_fresh(conn: &Connection) -> NativeResult<bool> {
+        let built_gen: Option<i64> = conn
+            .query_row(
+                "SELECT (SELECT value FROM meta WHERE key='bitmap_built_gen')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        let Some(built_gen) = built_gen else {
+            return Ok(false);
+        };
+        let write_gen: i64 = conn
+            .query_row(
+                "SELECT COALESCE((SELECT value FROM meta WHERE key='write_gen'), 0)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        Ok(write_gen <= built_gen)
     }
 
     /// Drop any leftover shadow tables (a prior aborted rebuild) and create
@@ -1666,7 +1795,8 @@ impl shrike_store::DerivedStore for DerivedEngine {
         Self::ingest_many(self, notes, source)
     }
     fn refresh_derived_snapshots(&self) -> NativeResult<()> {
-        Self::refresh_trigram_df(self)
+        Self::refresh_trigram_df(self)?;
+        Self::refresh_trigram_bitmaps(self)
     }
     fn remove(&self, note_ids: &[i64], source: Option<&str>) -> NativeResult<()> {
         Self::remove(self, note_ids, source)
@@ -2732,9 +2862,10 @@ impl DerivedEngine {
     /// (rare) trigrams each indexed rowid shares, from the per-term posting sets
     /// gathered rowid-only by [`Self::fuzzy_term_rowids`]. Provenance-free, so it
     /// runs before the survivors' `(note_id, source, ref)` is known.
+    #[allow(dead_code)] // reference for the bit-sliced fuzzy_rank_query cross-check + revert.
     fn accumulate_overlap(
         pruned_terms: &[String],
-        term_rowids: &std::collections::HashMap<String, Vec<i64>>,
+        term_bitmaps: &std::collections::HashMap<String, roaring::RoaringBitmap>,
     ) -> FxI64Map<usize> {
         // Preallocate to the sum of the rare trigrams' posting lengths — the upper
         // bound on distinct rowids (a rowid shared across trigrams just over-counts
@@ -2744,19 +2875,185 @@ impl DerivedEngine {
         // dropped at the end of the query.
         let cap: usize = pruned_terms
             .iter()
-            .filter_map(|t| term_rowids.get(t))
-            .map(Vec::len)
+            .filter_map(|t| term_bitmaps.get(t))
+            .map(|b| b.len() as usize)
             .sum();
         let mut overlap: FxI64Map<usize> =
             std::collections::HashMap::with_capacity_and_hasher(cap, Default::default());
         for term in pruned_terms {
-            if let Some(rowids) = term_rowids.get(term) {
-                for &rid in rowids {
-                    *overlap.entry(rid).or_insert(0) += 1;
+            if let Some(bm) = term_bitmaps.get(term) {
+                for rid in bm.iter() {
+                    *overlap.entry(rid as i64).or_insert(0) += 1;
                 }
             }
         }
         overlap
+    }
+
+    /// Load the pruned trigrams' precomputed posting bitmaps from
+    /// `trigram_bitmap` in ONE query (inline `IN` over the ≤cap distinct terms),
+    /// keyed by term. A term with no row (never indexed) is simply absent from the
+    /// map — the overlap accumulation skips it, exactly as an empty FTS5 posting
+    /// would.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read or a bitmap deserialize fails.
+    fn load_trigram_bitmaps(
+        conn: &Connection,
+        terms: &[&str],
+    ) -> NativeResult<std::collections::HashMap<String, roaring::RoaringBitmap>> {
+        let mut out = std::collections::HashMap::new();
+        if terms.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = (0..terms.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT term, bm FROM trigram_bitmap WHERE term IN ({placeholders})");
+        let run = || -> rusqlite::Result<Vec<(String, Vec<u8>)>> {
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let mut q = stmt.query(rusqlite::params_from_iter(terms.iter().copied()))?;
+            let mut rows = Vec::new();
+            while let Some(r) = q.next()? {
+                rows.push((r.get(0)?, r.get(1)?));
+            }
+            Ok(rows)
+        };
+        for (term, blob) in with_busy_retry(run)? {
+            let bm = roaring::RoaringBitmap::deserialize_from(&blob[..])
+                .map_err(|e| NativeError::internal(e.to_string()))?;
+            out.insert(term, bm);
+        }
+        Ok(out)
+    }
+
+    /// Bit-sliced overlap counting. Returns the count "bit planes" `acc` where the
+    /// overlap count of a rowid is `Σ_b 2^b · [rid ∈ acc[b]]`. Adds each input
+    /// bitmap with a ripple-carry across the planes (XOR = sum bit, AND = carry), so
+    /// the per-rowid overlap for EVERY rowid is computed in `O(k·log k)` bitmap ops
+    /// — `O(containers)`, independent of posting size. That is the dense-posting win
+    /// the per-rowid accumulation loop can't get: a trigram in tens of thousands of
+    /// notes is one bitmap container, so adding it costs a few SIMD word ops, not
+    /// one increment per rowid.
+    fn bitsliced_overlap(bitmaps: &[&roaring::RoaringBitmap]) -> Vec<roaring::RoaringBitmap> {
+        use roaring::RoaringBitmap;
+        let mut acc: Vec<RoaringBitmap> = Vec::new();
+        for &b in bitmaps {
+            let mut carry = b.clone();
+            let mut level = 0usize;
+            while !carry.is_empty() {
+                if level == acc.len() {
+                    acc.push(RoaringBitmap::new());
+                }
+                let new_carry = &acc[level] & &carry; // carry-out = already-set AND incoming
+                acc[level] ^= &carry; // sum bit at this plane
+                carry = new_carry;
+                level += 1;
+            }
+        }
+        acc
+    }
+
+    /// The rowids whose bit-sliced overlap count is EXACTLY `c`: AND the planes `c`
+    /// has set, then subtract every plane it has clear — a rowid survives iff its
+    /// plane membership is exactly `c`'s bit pattern. `c == 0` selects nothing.
+    fn count_eq(acc: &[roaring::RoaringBitmap], c: u32) -> roaring::RoaringBitmap {
+        use roaring::RoaringBitmap;
+        // A count whose highest set bit is beyond the planes can't exist (the loop
+        // walks c up to the term count, which may exceed the realized max overlap).
+        if 32 - c.leading_zeros() > acc.len() as u32 {
+            return RoaringBitmap::new();
+        }
+        let set: Vec<usize> = (0..acc.len()).filter(|&b| (c >> b) & 1 == 1).collect();
+        let Some((&first, rest)) = set.split_first() else {
+            return RoaringBitmap::new();
+        };
+        let mut out = acc[first].clone();
+        for &b in rest {
+            out &= &acc[b];
+        }
+        for (b, plane) in acc.iter().enumerate() {
+            if (c >> b) & 1 == 0 {
+                out -= plane;
+            }
+        }
+        out
+    }
+
+    /// One query's fuzzy ranking via the bit-sliced overlap planes, hydrating only
+    /// as deep as the threshold top-k needs. Walks the overlap-count buckets high →
+    /// low; each bucket hydrates its rowids (the same source/scope filter as
+    /// [`Self::seg_meta_for_rowids`]) and records the best segment per note (highest
+    /// count, lowest rowid). Processing high → low means a note's FIRST appearance
+    /// is its highest-count (best) segment, and ascending rowid order within a
+    /// bucket makes the first the lowest-rowid tiebreak — exactly
+    /// [`Self::rank_overlap`]'s `best`. Once `top_k` notes are locked at a count, no
+    /// lower bucket (a strictly smaller count) can enter the top-k, so it stops —
+    /// bounding the hydration to the high-overlap head instead of every
+    /// `count >= FUZZY_MIN_SHARED` candidate. The result is identical to
+    /// `accumulate_overlap` + `rank_overlap` (pinned by a cross-check test); a
+    /// fetch-all (`top_k` past the candidate count) never trips the stop and walks
+    /// every bucket.
+    fn fuzzy_rank_query(
+        conn: &Connection,
+        pruned_terms: &[String],
+        term_bitmaps: &std::collections::HashMap<String, roaring::RoaringBitmap>,
+        top_k: usize,
+        exclude_sources: &[&str],
+        scope: Option<&[i64]>,
+    ) -> NativeResult<Vec<(i64, String, String, i64)>> {
+        // top_k == 0 selects nothing — match rank_overlap's truncate-to-empty (a
+        // huge fetch-all top_k, not 0, is the "return all" sentinel).
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let bitmaps: Vec<&roaring::RoaringBitmap> = pruned_terms
+            .iter()
+            .filter_map(|t| term_bitmaps.get(t))
+            .collect();
+        // Fewer present postings than the floor can never reach the overlap minimum.
+        if bitmaps.len() < FUZZY_MIN_SHARED {
+            return Ok(Vec::new());
+        }
+        let acc = Self::bitsliced_overlap(&bitmaps);
+        let max_count = bitmaps.len() as u32;
+        // note_id -> (count, rowid, source, ref) for its best segment.
+        let mut best: FxI64Map<(usize, i64, String, String)> = FxI64Map::default();
+        for c in (FUZZY_MIN_SHARED as u32..=max_count).rev() {
+            let bucket = Self::count_eq(&acc, c);
+            if !bucket.is_empty() {
+                let rids: Vec<i64> = bucket.iter().map(i64::from).collect();
+                let meta = Self::seg_meta_for_rowids(conn, &rids, exclude_sources, scope)?;
+                // `rids` is ascending (bitmap iteration order), so the first segment
+                // recorded for a note is its lowest rowid at this — its best — count.
+                for &rid in &rids {
+                    if let Some((nid, source, r)) = meta.get(&rid) {
+                        best.entry(*nid)
+                            .or_insert_with(|| (c as usize, rid, source.clone(), r.clone()));
+                    }
+                }
+            }
+            // Every note in `best` now has count >= c; the next bucket is c-1 < c, so
+            // it can never displace a locked top-k. A fetch-all top_k never trips this.
+            if top_k > 0 && best.len() >= top_k {
+                break;
+            }
+        }
+        let mut ranked: Vec<(i64, usize, i64, String, String)> = best
+            .into_iter()
+            .map(|(nid, (count, rid, source, r))| (nid, count, rid, source, r))
+            .collect();
+        // count desc, then note-id asc — the rank_overlap order.
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        if top_k > 0 {
+            ranked.truncate(top_k);
+        }
+        Ok(ranked
+            .into_iter()
+            .map(|(nid, _c, rid, source, r)| (nid, source, r, rid))
+            .collect())
     }
 
     /// Rank one query's accumulated overlap into its survivors. A segment's overlap
@@ -2771,6 +3068,7 @@ impl DerivedEngine {
     /// `exclude_sources` or an out-of-scope `note_id`, so "absent" means "filtered
     /// out," and skipping it makes a note rank by its best surviving segment — the
     /// same result a `source NOT IN` / `note_id IN` MATCH predicate would give.
+    #[allow(dead_code)] // reference for the bit-sliced fuzzy_rank_query cross-check + revert.
     fn rank_overlap(
         overlap: &FxI64Map<usize>,
         seg_meta: &FxI64Map<(i64, String, String)>,
@@ -3000,37 +3298,34 @@ impl DerivedEngine {
         // SQLite build an ephemeral index over the set (a temp btree on the pcache
         // mutex). rank_overlap skips a candidate absent from `seg_meta`, so a dropped
         // segment never ranks.
-        let term_rowids = Self::fuzzy_term_rowids(&conn, &distinct_terms_vec)?;
-        let overlaps: Vec<FxI64Map<usize>> = pruned
+        // The pruned trigrams' posting bitmaps: from the precomputed table when it
+        // still covers the live index, else built in-memory from the live FTS5
+        // postings so a write since the last rebuild is still found. Either source
+        // feeds the same bit-sliced ranker — counting overlap with bitmap ops (not a
+        // per-rowid loop) and hydrating only as deep as the threshold top-k needs.
+        let term_bitmaps: std::collections::HashMap<String, roaring::RoaringBitmap> =
+            if Self::bitmaps_fresh(&conn)? {
+                Self::load_trigram_bitmaps(&conn, &distinct_terms_vec)?
+            } else {
+                Self::fuzzy_term_rowids(&conn, &distinct_terms_vec)?
+                    .into_iter()
+                    .map(|(term, rids)| (term, rids.into_iter().map(|r| r as u32).collect()))
+                    .collect()
+            };
+        let survivors: Vec<Vec<(i64, String, String, i64)>> = pruned
             .iter()
-            .map(|p| {
-                p.as_ref().map_or_else(FxI64Map::default, |terms| {
-                    Self::accumulate_overlap(terms, &term_rowids)
-                })
+            .map(|p| match p {
+                Some(terms) => Self::fuzzy_rank_query(
+                    &conn,
+                    terms,
+                    &term_bitmaps,
+                    top_k as usize,
+                    exclude_sources,
+                    scope,
+                ),
+                None => Ok(Vec::new()),
             })
-            .collect();
-        // An FxHash set, not a BTreeSet: the candidate set only DEDUPES the rowids it
-        // hands to seg_meta hydration (order is irrelevant — rank_overlap iterates the
-        // overlap map, not this set), so O(1) inserts beat the BTree's O(log n)
-        // pointer-chasing on a set this hot.
-        let mut candidates: FxI64Set = FxI64Set::default();
-        for ov in &overlaps {
-            for (&rid, &count) in ov {
-                if count >= FUZZY_MIN_SHARED {
-                    candidates.insert(rid);
-                }
-            }
-        }
-        let seg_meta = Self::seg_meta_for_rowids(
-            &conn,
-            &candidates.into_iter().collect::<Vec<_>>(),
-            exclude_sources,
-            scope,
-        )?;
-        let survivors: Vec<Vec<(i64, String, String, i64)>> = overlaps
-            .iter()
-            .map(|ov| Self::rank_overlap(ov, &seg_meta, top_k as usize))
-            .collect();
+            .collect::<NativeResult<_>>()?;
         // Build snippets for the surviving rowids only, from text read by a plain
         // rowid lookup (no MATCH re-scan) and windowed in Rust around the query's
         // own rare trigrams.
@@ -3378,6 +3673,74 @@ mod lexical_tests {
         let hits = e.search_fuzzy("mitochondira", 10, None, &[]).unwrap(); // transposition
         assert!(hits.iter().any(|(nid, ..)| *nid == 1));
         assert!(e.search_fuzzy("xy", 10, None, &[]).unwrap().is_empty()); // too short to rank
+    }
+
+    #[test]
+    fn fuzzy_rank_query_matches_accumulate_and_rank_overlap() {
+        // The bit-sliced threshold ranker must produce byte-identical results to the
+        // reference (accumulate_overlap + rank_overlap) on identical inputs — across
+        // multi-segment notes (Front+Back, so a note's best field wins the collapse),
+        // ties (ranked by note id), and every top_k cut (which exercises the
+        // early-stop). Both paths consume the same pruned terms + loaded bitmaps, so
+        // any divergence is the ranker's, not the prune/load.
+        let dir = std::env::temp_dir().join(format!(
+            "shrike-derived-xcheck-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = DerivedEngine::open(dir.join("shrike.db").to_str().unwrap(), 1).unwrap();
+        let words = ["alphabravo", "charlie", "deltaecho", "foxtrot", "golfhotel"];
+        let mut rows: Vec<(i64, String, String, String)> = Vec::new();
+        for n in 1..=12usize {
+            let front = format!(
+                "{} {}",
+                words[n % words.len()],
+                words[(n + 1) % words.len()]
+            );
+            let back = words[(n + 2) % words.len()].to_string();
+            rows.push((n as i64, "field".into(), "Front".into(), front));
+            rows.push((n as i64, "field".into(), "Back".into(), back));
+        }
+        build_snapshot_live(&e, &rows, 1).unwrap();
+
+        let conn = e.read_pool.checkout().unwrap();
+        let policy = e.fuzzy_cap_policy();
+        let queries = [
+            "alphabravo charlie",
+            "deltaecho foxtrot golfhotel",
+            "alphabravo charlie deltaecho",
+            "charlie golfhotel",
+        ];
+        for q in queries {
+            let Some(grams) = DerivedEngine::fuzzy_grams(q) else {
+                continue;
+            };
+            let gram_strs: Vec<&str> = grams.iter().map(String::as_str).collect();
+            let df = DerivedEngine::trigram_dfs(&conn, &gram_strs).unwrap();
+            let pruned = DerivedEngine::prune_to_rare_terms(&grams, &df, policy);
+            let distinct: Vec<&str> = pruned.iter().map(String::as_str).collect();
+            let bitmaps = DerivedEngine::load_trigram_bitmaps(&conn, &distinct).unwrap();
+            for &top_k in &[1usize, 2, 3, 5, 10, 100] {
+                // Reference: accumulate_overlap → candidates(≥2) → seg_meta → rank.
+                let overlap = DerivedEngine::accumulate_overlap(&pruned, &bitmaps);
+                let candidates: Vec<i64> = overlap
+                    .iter()
+                    .filter(|(_, &c)| c >= FUZZY_MIN_SHARED)
+                    .map(|(&r, _)| r)
+                    .collect();
+                let seg_meta =
+                    DerivedEngine::seg_meta_for_rowids(&conn, &candidates, &[], None).unwrap();
+                let reference = DerivedEngine::rank_overlap(&overlap, &seg_meta, top_k);
+                let bit_sliced =
+                    DerivedEngine::fuzzy_rank_query(&conn, &pruned, &bitmaps, top_k, &[], None)
+                        .unwrap();
+                assert_eq!(reference, bit_sliced, "query {q:?} top_k {top_k}");
+            }
+        }
     }
 
     #[test]
@@ -4255,6 +4618,51 @@ mod lexical_tests {
             hits.iter().any(|(nid, ..)| *nid == 100),
             "note 100, matched only via just-written trigrams, must surface under a stale snapshot"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn freshness_gate_catches_delete_insert_rowid_reuse() {
+        // A delete-heavy-then-insert batch reuses the freed high rowids, so a
+        // max-rowid watermark would NOT rise — the gate would read "fresh" and serve
+        // stale bitmaps that never saw the new notes, hiding them. The write
+        // generation bumps on every write, so the gate reads stale → live fallback →
+        // the new notes surface. (Regression for the freshness-gate CRITICAL.)
+        let dir = std::env::temp_dir().join(format!(
+            "shrike-derived-genreuse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = DerivedEngine::open(dir.join("shrike.db").to_str().unwrap(), 1).unwrap();
+        let rows: Vec<(i64, String, String, String)> = (1..=10i64)
+            .map(|n| (n, "field".into(), "Front".into(), format!("commonword{n}")))
+            .collect();
+        build_snapshot_live(&e, &rows, 1).unwrap();
+        e.remove(&[6, 7, 8, 9, 10], None).unwrap();
+        e.ingest_many(
+            &[
+                (11, vec![("Front".into(), "xraywhiskey".into())]),
+                (12, vec![("Front".into(), "uniformtango".into())]),
+                (13, vec![("Front".into(), "sierraromeo".into())]),
+            ],
+            "field",
+        )
+        .unwrap();
+        for (nid, q) in [
+            (11, "xraywhiskey"),
+            (12, "uniformtango"),
+            (13, "sierraromeo"),
+        ] {
+            let hits = e.search_fuzzy(q, 10, None, &[]).unwrap();
+            assert!(
+                hits.iter().any(|h| h.0 == nid),
+                "new note {nid} ({q}) must surface — write-gen gate caught the reused-rowid write"
+            );
+        }
         std::fs::remove_dir_all(dir).ok();
     }
 }
