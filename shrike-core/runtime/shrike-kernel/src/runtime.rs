@@ -84,13 +84,6 @@ impl PoolJob {
     }
 }
 
-/// The histogram bucket ladder (seconds) shared by every kernel duration metric —
-/// the same 13-bucket ladder the Python instruments use, so both halves of
-/// /metrics share one latency scale.
-const DURATION_BUCKETS: [f64; 13] = [
-    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-];
-
 /// The installed Prometheus pull exporter handle. [`render_prometheus`] renders
 /// it for the control-plane /metrics body (appended after the Python registry).
 static PROMETHEUS: OnceLock<PrometheusHandle> = OnceLock::new();
@@ -104,8 +97,6 @@ fn install_prometheus() {
     let _ = PROMETHEUS.get_or_init(|| {
         let handle = PrometheusBuilder::new()
             .with_recommended_naming(true)
-            .set_buckets(&DURATION_BUCKETS)
-            .expect("the duration bucket ladder is non-empty")
             .install_recorder()
             .expect("the Prometheus recorder installs exactly once per process");
         describe_kernel_metrics();
@@ -158,7 +149,7 @@ fn describe_kernel_metrics() {
     );
     describe_counter!(
         "shrike_embedding_items",
-        "Items submitted for embedding by space, modality, and operation."
+        "Items submitted for embedding by space, modality, operation, and result."
     );
     describe_histogram!(
         "shrike_embedding_duration",
@@ -290,6 +281,7 @@ pub fn record_embedding(modality: &str, items: usize, elapsed: Duration, success
         "space" => space.clone(),
         "modality" => modality.to_owned(),
         "operation" => operation,
+        "result" => result,
     )
     .increment(items as u64);
     histogram!(
@@ -308,7 +300,7 @@ pub fn record_embedding(modality: &str, items: usize, elapsed: Duration, success
 pub(crate) fn record_saver_run(success: bool, elapsed: Duration, pending: u64) {
     let result = if success { "ok" } else { "error" };
     counter!("shrike_index_saver_runs", "result" => result).increment(1);
-    histogram!("shrike_index_saver_duration").record(elapsed.as_secs_f64());
+    histogram!("shrike_index_saver_duration", "result" => result).record(elapsed.as_secs_f64());
     gauge!("shrike_index_saver_pending").set(pending as f64);
 }
 
@@ -1317,6 +1309,7 @@ mod compute_pool {
                 record_embedding("text", 3, Duration::from_millis(5), true);
             })
             .await;
+            record_saver_run(true, Duration::from_millis(2), 0);
         });
         let rendered = render_prometheus();
         // Counters carry `_total`; the duration histograms carry `_seconds`.
@@ -1336,5 +1329,19 @@ mod compute_pool {
         assert!(rendered.contains("operation=\"query\""), "{rendered}");
         assert!(rendered.contains("space=\"primary\""), "{rendered}");
         assert!(rendered.contains("result=\"ok\""), "{rendered}");
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.starts_with("shrike_embedding_items_total")
+                    && line.contains("result=\"ok\"")),
+            "embedding item counter must carry result label:\n{rendered}"
+        );
+        assert!(
+            rendered.lines().any(
+                |line| line.starts_with("shrike_index_saver_duration_seconds")
+                    && line.contains("result=\"ok\"")
+            ),
+            "saver duration histogram must carry result label:\n{rendered}"
+        );
     }
 }
