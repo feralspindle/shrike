@@ -100,6 +100,7 @@ fn install_prometheus() {
             .install_recorder()
             .expect("the Prometheus recorder installs exactly once per process");
         describe_kernel_metrics();
+        gauge!("shrike_index_saver_pending").set(0.0);
         handle
     });
 }
