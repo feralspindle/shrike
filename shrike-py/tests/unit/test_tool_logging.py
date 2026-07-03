@@ -45,6 +45,11 @@ def _broken_tool() -> None:
     raise RuntimeError("boom")
 
 
+def _bad_output_tool(x: int) -> int:
+    """Returns a value that fails the generated output schema."""
+    return "not-an-int"  # type: ignore[return-value]
+
+
 class TestCompletionLine:
     def test_one_info_line_with_params_outcome_duration(
         self, caplog: pytest.LogCaptureFixture
@@ -173,4 +178,25 @@ class TestMcpActionRecording:
         monkeypatch.setattr(mcp_adapter.metrics, "observe_action", lambda *a: calls.append(a))
         await mcp._tool_manager.call_tool("_ok_tool", {"x": 1})
         # _safe_tool records the ok outcome once; the wrapper adds nothing on success.
+        assert [c[2] for c in calls] == ["ok"], calls
+
+    async def test_convert_result_output_validation_not_relabelled_as_input_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from mcp.server.fastmcp import FastMCP
+
+        from shrike.api import mcp_adapter
+
+        mcp = FastMCP("test")
+        mcp.tool()(_safe_tool(_bad_output_tool))
+        mcp_adapter._instrument_tool_manager(mcp)
+
+        calls: list[tuple] = []
+        monkeypatch.setattr(mcp_adapter.metrics, "observe_action", lambda *a: calls.append(a))
+        with pytest.raises(ToolError):
+            await mcp.call_tool("_bad_output_tool", {"x": 1})
+
+        # FastMCP.call_tool uses convert_result=True, so this fails after the
+        # impl returns. _safe_tool already recorded that served impl once; the
+        # manager wrapper must not double-count it as client input.
         assert [c[2] for c in calls] == ["ok"], calls

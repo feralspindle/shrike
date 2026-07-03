@@ -43,6 +43,7 @@ logger = logging.getLogger("shrike.tools")
 # HTTP handler sets this for the duration of Tool.run; MCP naturally retains the
 # default.  ContextVar keeps concurrent requests isolated.
 _action_transport: ContextVar[str] = ContextVar("shrike_action_transport", default="mcp")
+_action_recorded: ContextVar[bool] = ContextVar("shrike_action_recorded", default=False)
 
 # The readiness gate: an async callable that resolves once the data plane is
 # open (boot/reload/re-acquire maintenance has settled). None disables gating
@@ -98,6 +99,7 @@ def _log_completed(name: str, kwargs: dict[str, Any], started: float) -> None:
 
 
 def _record_action(name: str, started: float, result: str) -> None:
+    _action_recorded.set(True)
     metrics.observe_action(name, _action_transport.get(), result, time.perf_counter() - started)
 
 
@@ -125,6 +127,7 @@ def _safe_tool(fn: Any) -> Any:
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
             started = time.perf_counter()
             _call_outcome.set(None)  # never inherit a previous call's outcome
+            _action_recorded.set(False)
             try:
                 result = await fn(*args, **kwargs)
             except ToolInputError as e:
@@ -164,6 +167,7 @@ def _safe_tool(fn: Any) -> Any:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         started = time.perf_counter()
         _call_outcome.set(None)  # never inherit a previous call's outcome
+        _action_recorded.set(False)
         try:
             result = fn(*args, **kwargs)
         except ToolInputError as e:
@@ -244,8 +248,11 @@ def _instrument_tool_manager(mcp: FastMCP) -> None:
     without this the two transports disagree. Wrap the tool manager's ``call_tool``
     (the single seam every MCP ``tools/call`` flows through) to record it, with
     the ``mcp`` transport from the ContextVar. Impl-path outcomes are already
-    recorded by ``_safe_tool``, so only the pre-impl validation gap is filled.
-    Idempotent — wrapping once per manager.
+    recorded by ``_safe_tool``. The ``_action_recorded`` sentinel distinguishes
+    that path from FastMCP's pre-impl arg validation: output-schema failures
+    under ``convert_result=True`` and raw impl validation bugs must not be
+    double-counted or relabelled as caller input. Idempotent — wrapping once per
+    manager.
     """
     manager = mcp._tool_manager
     if getattr(manager, "_shrike_instrumented", False):
@@ -254,11 +261,12 @@ def _instrument_tool_manager(mcp: FastMCP) -> None:
 
     async def call_tool(name: str, arguments: dict[str, Any], **kwargs: Any) -> Any:
         started = time.perf_counter()
+        _action_recorded.set(False)
         try:
             return await original_call_tool(name, arguments, **kwargs)
         except Exception as exc:
             cause = exc.__cause__ if exc.__cause__ is not None else exc
-            if isinstance(cause, ValidationError):
+            if isinstance(cause, ValidationError) and not _action_recorded.get():
                 _record_action(name, started, "input_error")
             raise
 
