@@ -60,6 +60,18 @@ class CollectionProfile:
     cache_dir: str | None = None
 
 
+def _validate_profile_name(name: str) -> str:
+    name = name.strip()
+    if not name:
+        raise RegistryError("profile name must not be empty")
+    if name.startswith("__") and name.endswith("__"):
+        raise RegistryError(
+            f"profile name {name!r} is reserved; names wrapped in double underscores "
+            "are reserved for Shrike internals"
+        )
+    return name
+
+
 @dataclass
 class Registry:
     """The in-memory view of the ``profiles:`` config section.
@@ -113,9 +125,7 @@ class Registry:
         ``make_default`` records this profile as the active default (also done
         automatically when it is the first profile registered).
         """
-        name = name.strip()
-        if not name:
-            raise RegistryError("profile name must not be empty")
+        name = _validate_profile_name(name)
         if not path or not path.strip():
             raise RegistryError(f"profile {name!r}: collection path must not be empty")
         if self.get(name) is not None:
@@ -147,9 +157,7 @@ class Registry:
         index/cache impact**: index identity keys on the collection *path*, never
         the profile name, so this is a pure config edit.
         """
-        new = new.strip()
-        if not new:
-            raise RegistryError("profile name must not be empty")
+        new = _validate_profile_name(new)
         existing = self.get(old)
         if existing is None:
             raise RegistryError(f"profile {old!r} is not registered")
@@ -220,8 +228,8 @@ class Registry:
         for entry in entries:
             name = str(entry.get("name", "")).strip()
             path = entry.get("path")
-            if not name or not path:
-                # A malformed entry (no name/path) is skipped rather than
+            if not name or not path or (name.startswith("__") and name.endswith("__")):
+                # A malformed/reserved entry is skipped rather than
                 # crashing every command — the CLI's add/remove rewrites it.
                 continue
             emb = entry.get("embedding")

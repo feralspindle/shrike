@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use blake2::digest::consts::U8;
@@ -590,6 +591,10 @@ impl IndexOrchestrator {
     pub fn save(&self) -> NativeResult<()> {
         // Savers serialize against each other; everything else stays free.
         let _saving = self.save_guard.lock().expect("save guard poisoned");
+        self.save_unlocked()
+    }
+
+    fn save_unlocked(&self) -> NativeResult<()> {
         let Some(ndim) = self.engine.ndim() else {
             return Ok(()); // nothing built — nothing to persist
         };
@@ -698,40 +703,96 @@ impl IndexOrchestrator {
 pub struct DebouncedSaver {
     orchestrator: Arc<IndexOrchestrator>,
     job: Arc<crate::maintenance::Maintenance>,
+    requested_epoch: AtomicU64,
+    saved_epoch: AtomicU64,
+    recorded_epoch: AtomicU64,
 }
 
 impl DebouncedSaver {
+    fn save_and_record_once(&self, epoch: u64, started: std::time::Instant) -> NativeResult<()> {
+        let result = {
+            let _saving = self
+                .orchestrator
+                .save_guard
+                .lock()
+                .expect("save guard poisoned");
+            let result = if self.saved_epoch.load(Ordering::SeqCst) >= epoch {
+                Ok(())
+            } else {
+                self.orchestrator.save_unlocked()
+            };
+            if result.is_ok() {
+                self.saved_epoch.store(epoch, Ordering::SeqCst);
+            }
+            if self.recorded_epoch.load(Ordering::SeqCst) < epoch {
+                crate::runtime::record_saver_run(
+                    result.is_ok(),
+                    started.elapsed(),
+                    self.job.pending(),
+                );
+                self.recorded_epoch.store(epoch, Ordering::SeqCst);
+            }
+            result
+        };
+        if let Err(e) = &result {
+            tracing::warn!(error = ?e, "debounced index save failed");
+        }
+        result
+    }
+
     /// Build a saver over `orchestrator` with the idle-debounce `delay_secs`
     /// (clamped non-negative) and the burst-cap `threshold`.
     pub fn new(orchestrator: Arc<IndexOrchestrator>, delay_secs: f64, threshold: u64) -> Arc<Self> {
         let delay = std::time::Duration::from_secs_f64(delay_secs.max(0.0));
-        let orch = Arc::clone(&orchestrator);
-        let job = crate::maintenance::Maintenance::new(
-            Box::new(move || {
-                let orch = Arc::clone(&orch);
-                Box::pin(async move {
-                    // The blocking file write rides the compute pool; a detached
-                    // runtime future (driven by `drive_io`) awaits the pool job,
-                    // keeping the write off every timer and op-tail path.
-                    let save = crate::runtime::dispatch_compute(move || {
-                        orch.save().map_err(|e| {
-                            tracing::warn!(error = ?e, "debounced index save failed");
-                            e
-                        })
-                    });
-                    let _ = save.await;
-                })
-            }),
-            delay,
-            delay,
-            threshold,
-        );
-        Arc::new(Self { orchestrator, job })
+        // `new_cyclic` hands the run closure a `Weak<Self>` before the `Arc`
+        // exists, so the closure can read the *live* pending count from its own
+        // `job` after each save — the metric tracks the real backlog rather than a
+        // mirror that drifts. Saver epochs are recorded under the same guard that
+        // serializes writes, so a cooperative `cancel` racing a run's metric tail
+        // cannot double-count one requested flush window.
+        Arc::new_cyclic(|me: &std::sync::Weak<Self>| {
+            let me = me.clone();
+            let job = crate::maintenance::Maintenance::new(
+                Box::new(move || {
+                    use tracing::Instrument as _;
+                    let me = me.clone();
+                    Box::pin(
+                        async move {
+                            let Some(saver) = me.upgrade() else {
+                                return;
+                            };
+                            let started = std::time::Instant::now();
+                            let epoch = saver.requested_epoch.load(Ordering::SeqCst);
+                            // The blocking file write rides the compute pool; a
+                            // detached runtime future (driven by `drive_io`) awaits
+                            // the pool job, keeping the write off every timer path.
+                            let _ = crate::runtime::dispatch_compute(move || {
+                                saver.save_and_record_once(epoch, started)
+                            })
+                            .await;
+                        }
+                        .instrument(tracing::debug_span!("kernel.index_save")),
+                    )
+                }),
+                delay,
+                delay,
+                threshold,
+            );
+            Self {
+                orchestrator,
+                job,
+                requested_epoch: AtomicU64::new(0),
+                saved_epoch: AtomicU64::new(0),
+                recorded_epoch: AtomicU64::new(0),
+            }
+        })
     }
 
     /// Record a change: re-arm the idle timer, or flush now at the burst cap.
     pub fn request_save(&self) {
+        self.requested_epoch.fetch_add(1, Ordering::SeqCst);
         self.job.request();
+        crate::runtime::record_saver_request(self.job.pending());
     }
 
     /// Unsaved changes since the last flush was handed off.
@@ -743,10 +804,12 @@ impl DebouncedSaver {
     /// save failure is logged, not propagated — used at shutdown so close()
     /// returns only after the write lands).
     pub fn flush(&self) {
+        // Synchronous (no await): an entered guard is safe here.
+        let _span = tracing::debug_span!("kernel.index_flush").entered();
         self.job.cancel();
-        if let Err(e) = self.orchestrator.save() {
-            tracing::warn!(error = ?e, "debounced index save failed");
-        }
+        let started = std::time::Instant::now();
+        let epoch = self.requested_epoch.load(Ordering::SeqCst);
+        let _ = self.save_and_record_once(epoch, started);
     }
 }
 
@@ -754,6 +817,7 @@ impl DebouncedSaver {
 mod tests {
     use super::*;
     use shrike_index::MultiModalIndex;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
     #[test]
     fn hash_text_matches_python_blake2b() {
@@ -831,6 +895,137 @@ mod tests {
         Arc::new(IndexOrchestrator::open(dir, engine))
     }
 
+    struct BlockingSaveIndex {
+        inner: MultiModalIndex,
+        entered_first_save: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+        release_first_save: Mutex<std::sync::mpsc::Receiver<()>>,
+        first_save_waited: AtomicBool,
+        save_calls: AtomicU64,
+    }
+
+    impl BlockingSaveIndex {
+        fn new(
+            entered_first_save: std::sync::mpsc::SyncSender<()>,
+            release_first_save: std::sync::mpsc::Receiver<()>,
+        ) -> Self {
+            Self {
+                inner: MultiModalIndex::new(vec!["text".to_owned()]).unwrap(),
+                entered_first_save: Mutex::new(Some(entered_first_save)),
+                release_first_save: Mutex::new(release_first_save),
+                first_save_waited: AtomicBool::new(false),
+                save_calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl VectorIndex for BlockingSaveIndex {
+        fn size(&self) -> usize {
+            self.inner.size()
+        }
+
+        fn ndim(&self) -> Option<usize> {
+            self.inner.ndim()
+        }
+
+        fn modality_sizes(&self) -> Vec<(String, usize)> {
+            self.inner.modality_sizes()
+        }
+
+        fn modality_stats(&self) -> Vec<(String, usize, Option<usize>)> {
+            self.inner.modality_stats()
+        }
+
+        fn modality_names(&self) -> Vec<String> {
+            self.inner.modality_names()
+        }
+
+        fn ensure(&self, modality: &str, ndim: usize) -> NativeResult<()> {
+            self.inner.ensure(modality, ndim)
+        }
+
+        fn clear(&self) {
+            self.inner.clear();
+        }
+
+        fn drop_modality(&self, modality: &str) {
+            self.inner.drop_modality(modality);
+        }
+
+        fn restore(&self, dir: &str, candidates: Option<&[i64]>) -> bool {
+            self.inner.restore(dir, candidates)
+        }
+
+        fn save(&self, dir: &str) -> NativeResult<()> {
+            self.save_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if !self.first_save_waited.swap(true, AtomicOrdering::SeqCst) {
+                if let Some(tx) = self.entered_first_save.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                self.release_first_save
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .expect("test releases the first save");
+            }
+            self.inner.save(dir)
+        }
+
+        fn add(&self, modality: &str, keys: &[i64], vectors: &[Vec<f32>]) -> NativeResult<()> {
+            self.inner.add(modality, keys, vectors)
+        }
+
+        fn remove(&self, keys: &[i64]) -> NativeResult<usize> {
+            self.inner.remove(keys)
+        }
+
+        fn search_by_modality(
+            &self,
+            queries: &[Vec<f32>],
+            k: usize,
+            modalities: Option<&[String]>,
+            scope: Option<&[i64]>,
+        ) -> NativeResult<Vec<BTreeMap<String, shrike_store::ModalityRanking>>> {
+            self.inner.search_by_modality(queries, k, modalities, scope)
+        }
+
+        fn contains(&self, key: i64) -> bool {
+            self.inner.contains(key)
+        }
+
+        fn keys(&self) -> Vec<i64> {
+            self.inner.keys()
+        }
+
+        fn get(&self, key: i64) -> Option<Vec<Vec<f32>>> {
+            self.inner.get(key)
+        }
+
+        fn modality_contains(&self, modality: &str, key: i64) -> bool {
+            self.inner.modality_contains(modality, key)
+        }
+
+        fn modality_keys(&self, modality: &str) -> Vec<i64> {
+            self.inner.modality_keys(modality)
+        }
+
+        fn modality_get(&self, modality: &str, key: i64) -> Option<Vec<Vec<f32>>> {
+            self.inner.modality_get(modality, key)
+        }
+
+        fn dot_scores(&self, modality: &str, keys: &[i64], query: &[f32]) -> Vec<(i64, f32)> {
+            self.inner.dot_scores(modality, keys, query)
+        }
+
+        fn calibrate_activation(
+            &self,
+            sample_size: usize,
+            k: usize,
+            min_count: usize,
+        ) -> NativeResult<shrike_store::ActivationStats> {
+            self.inner.calibrate_activation(sample_size, k, min_count)
+        }
+    }
+
     #[test]
     fn drift_policy_matches_the_python_rules() {
         let orch = temp_orchestrator();
@@ -896,6 +1091,44 @@ mod tests {
         assert_eq!(saver.pending_changes(), 1);
         saver.flush();
         assert_eq!(saver.pending_changes(), 0);
+    }
+
+    #[test]
+    fn saver_flush_does_not_echo_in_flight_run_metrics() {
+        crate::runtime::testing::run(async {});
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let engine = Arc::new(BlockingSaveIndex::new(entered_tx, release_rx));
+        let orch_engine: Arc<dyn VectorIndex> = engine.clone();
+        let orch = Arc::new(IndexOrchestrator::open(
+            crate::test_support::collision_proof_dir("shrike-orch"),
+            orch_engine,
+        ));
+        orch.engine().ensure("text", 4).unwrap();
+        orch.set_col_mod(5);
+        let saver = DebouncedSaver::new(orch, 0.0, 1);
+
+        saver.request_save();
+        entered_rx
+            .recv()
+            .expect("background saver reached the first save");
+        let flushing = {
+            let saver = Arc::clone(&saver);
+            std::thread::spawn(move || saver.flush())
+        };
+        release_tx
+            .send(())
+            .expect("background saver still waits on the first save");
+        flushing.join().expect("flush must not panic");
+
+        assert_eq!(saver.requested_epoch.load(Ordering::SeqCst), 1);
+        assert_eq!(saver.saved_epoch.load(Ordering::SeqCst), 1);
+        assert_eq!(saver.recorded_epoch.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            engine.save_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "flush waited for the in-flight save instead of issuing an echo save"
+        );
     }
 
     #[test]
@@ -1060,7 +1293,14 @@ impl IndexOrchestrator {
         images: Option<(&dyn ImageEmbedder, &dyn ImageResolver)>,
         mode: WriteMode,
     ) -> NativeResult<usize> {
-        self.apply(inputs, embedder, images, true, mode).await
+        // Index-write embeds: tag the batch so the observed embedder attributes it
+        // to operation="index" (vs the search path's "query").
+        crate::runtime::embed_scope(
+            "primary".to_owned(),
+            "index",
+            self.apply(inputs, embedder, images, true, mode),
+        )
+        .await
     }
 
     /// The shared embed→engine pipeline behind [`Self::add`] (replace
@@ -1348,7 +1588,12 @@ impl IndexOrchestrator {
                 if chunk.is_empty() {
                     continue;
                 }
-                self.apply(&chunk, embedder, images, false, mode).await?;
+                crate::runtime::embed_scope(
+                    "primary".to_owned(),
+                    "index",
+                    self.apply(&chunk, embedder, images, false, mode),
+                )
+                .await?;
                 indexed += chunk.len() as u64;
                 self.shared
                     .lock()

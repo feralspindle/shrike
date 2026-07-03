@@ -42,6 +42,13 @@ class TestRegistryModel:
         with pytest.raises(RegistryError, match="path must not be empty"):
             reg.add("x", "   ")
 
+    def test_add_reserved_dunder_name_errors(self):
+        reg = Registry()
+        with pytest.raises(RegistryError, match="reserved"):
+            reg.add("__boot__", "/a/x.anki2")
+        with pytest.raises(RegistryError, match="reserved"):
+            reg.add("__private__", "/a/x.anki2")
+
     def test_remove_unknown_errors(self):
         reg = Registry()
         with pytest.raises(RegistryError, match="not registered"):
@@ -113,6 +120,12 @@ class TestRegistryModel:
         reg.add("a", "/a.anki2")
         with pytest.raises(RegistryError, match="name must not be empty"):
             reg.rename("a", "   ")
+
+    def test_rename_to_reserved_dunder_name_errors(self):
+        reg = Registry()
+        reg.add("a", "/a.anki2")
+        with pytest.raises(RegistryError, match="reserved"):
+            reg.rename("a", "__boot__")
 
     def test_rename_to_taken_name_errors(self):
         reg = Registry()
@@ -202,6 +215,7 @@ class TestRegistrySerialization:
             "entries": [
                 {"name": "", "path": "/a"},
                 {"path": "/b"},
+                {"name": "__boot__", "path": "/boot"},
                 {"name": "ok", "path": "/c"},
             ]
         }
