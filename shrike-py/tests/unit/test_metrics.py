@@ -66,7 +66,7 @@ def test_render_tolerates_absent_kernel_block(monkeypatch) -> None:
 
 def test_index_state_is_one_hot() -> None:
     registry = Metrics()
-    registry.update_index("vector", "building", 42)
+    registry.update_index("vector", "building", 42, collection="default")
     samples = _samples(registry.render()[0].decode())
     assert samples["shrike_index_entries[('collection', 'default'), ('index', 'vector')]"] == 42
 

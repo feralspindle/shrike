@@ -136,9 +136,7 @@ class Metrics:
         self.http_requests.labels(*labels).inc()
         self.http_duration.labels(*labels).observe(seconds)
 
-    def update_index(
-        self, index: str, state: str, size: int, *, collection: str = "default"
-    ) -> None:
+    def update_index(self, index: str, state: str, size: int, *, collection: str) -> None:
         self.index_size.labels(collection, index).set(size)
         for candidate in _INDEX_STATES:
             self.index_state.labels(collection, index, candidate).set(candidate == state)

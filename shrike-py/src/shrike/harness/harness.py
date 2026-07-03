@@ -263,10 +263,10 @@ class Harness:
         self.kernel = kernel
         self.wrapper = wrapper
         # The value of the ``collection`` label on every per-collection metric
-        # this harness emits. "default" for the boot collection; a routed
-        # harness gets its registry profile name, so multi-collection gauges
-        # (lock_held, collection_size, index size/state) keep one series per
-        # collection instead of all colliding on "default".
+        # this harness emits. BOOT_COLLECTION_KEY for the boot collection; a
+        # routed harness gets its registry profile name, so multi-collection
+        # gauges (lock_held, collection_size, index size/state) keep one series
+        # per collection instead of all colliding on a user-occupiable label.
         self._metrics_key = collection_key
         self.runtime = runtime
         # The shared llama.cpp ROUTER manager: when N remote/no-endpoint
